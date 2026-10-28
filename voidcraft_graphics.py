@@ -24,6 +24,34 @@ except ImportError as _wgpu_err:
     HAS_WGPU = False
     _WGPU_ERR = str(_wgpu_err)
 
+# ═══════════════════════════════════════════════
+#  GPU COMPUTE (optional, CuPy). Started lazily from run(), never at import, so the mesh
+#  worker processes do not each open a CUDA context. Everything falls back to numpy.
+# ═══════════════════════════════════════════════
+cp = None
+GPU_OK = False
+GPU_NAME = "not started"
+GPU_MIN_CELLS = 20000      # smaller grids are faster on the CPU than the copy to the GPU and back
+
+def _gpu_init():
+    """Try to start CuPy on the first CUDA device. Returns a one-line status for the console."""
+    global cp, GPU_OK, GPU_NAME
+    try:
+        import cupy as _cp
+        if _cp.cuda.runtime.getDeviceCount() < 1:
+            raise RuntimeError("no CUDA device")
+        probe = _cp.arange(8, dtype=_cp.int64)
+        if int(probe.sum()) != 28:                              # one real kernel, so a broken install shows up now
+            raise RuntimeError("CUDA self-test failed")
+        cp = _cp
+        GPU_NAME = _cp.cuda.runtime.getDeviceProperties(0)['name'].decode()
+        GPU_OK = True
+        return f"GPU physics: CuPy on {GPU_NAME}"
+    except Exception as err:
+        cp, GPU_OK = None, False
+        GPU_NAME = f"unavailable ({type(err).__name__}: {err})"
+        return f"GPU physics: off, using CPU. {GPU_NAME}"
+
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
 # ═══════════════════════════════════════════════
@@ -1204,31 +1232,42 @@ SETTINGS_TABS = [
         {'type': 'header', 'text': 'OVERLAY'},
         {'type': 'toggle', 'key': 'show_hud', 'label': 'Performance graphs',
          'help': 'Frame time and GPU graphs across the top of the screen. Also toggled with G.'},
+        {'type': 'header', 'text': 'COMPUTE'},
+        {'type': 'toggle', 'key': 'gpu_physics', 'label': 'GPU physics',
+         'help': 'Structure support checks run on the GPU (needs CuPy). Falls back to the CPU on its own.'},
     ]),
-    ("PARTICLES", [
+    ("DEBRIS", [
         {'type': 'header', 'text': 'DEBRIS'},
-        {'type': 'slider', 'key': 'debris_yield', 'label': 'Yield multiplier', 'min': 0.25, 'max': 4.0, 'step': 0.25,
-         'fmt': lambda v: f"{v:.2f}x",
-         'help': 'Dust particles thrown up per unit of dirt dug. 1.00x is the default.'},
-        {'type': 'slider', 'key': 'debris_size', 'label': 'Particle size', 'min': 0.5, 'max': 3.0, 'step': 0.25,
-         'fmt': lambda v: f"{v:.2f}x",
-         'help': 'Size of each dust particle on screen. 1.00x is the default.'},
-        {'type': 'slider', 'key': 'dirt_cubes', 'label': 'Mini cubes per block', 'min': 0, 'max': 100, 'step': 1,
-         'fmt': lambda v: f"{int(round(v))}",
-         'help': 'Dirt cubes each dug block splits into. More cubes means smaller ones. 0 turns them off.'},
-        {'type': 'slider', 'key': 'dirt_cube_size', 'label': 'Mini cube size', 'min': 0.1, 'max': 1.0, 'step': 0.05,
-         'fmt': lambda v: f"{v * 100:.0f}%",
-         'help': 'How much of its slot each mini cube fills. 100% is full size; smaller leaves gaps between them.'},
-        {'type': 'slider', 'key': 'cube_sleep_time', 'label': 'Sleep timer', 'min': 0.2, 'max': 5.0, 'step': 0.1,
-         'fmt': lambda v: f"{v:.1f} s",
-         'help': 'Seconds a mini cube must stay still before it goes to sleep. Sleeping cubes never wake up.'},
+        {'type': 'toggle', 'key': 'debris_on', 'label': 'Debris',
+         'help': 'Dirt cubes and dust from digging and blasts. Turning it off removes what is there.'},
+        {'type': 'slider', 'key': 'debris_amount', 'label': 'Amount', 'min': 0, 'max': 100, 'step': 10,
+         'when': 'debris_on', 'fmt': lambda v: f"{v}%",
+         'help': 'How much debris is made and kept. Lowering it deletes the oldest cubes.'},
+        {'type': 'slider', 'key': 'struct_res', 'label': 'Cube detail', 'min': 1, 'max': 10, 'step': 1,
+         'fmt': lambda v: f"{int(v)} cells per block ({int(v) ** 3} per block)",
+         'help': 'Test cubes keep their size but are built from smaller pieces. Rebuilds the cubes.'},
+    ]),
+    ("CONTROLS", [
+        {'type': 'header', 'text': 'WEAPONS (number keys, left click fires)                  KEYS'},
+        {'type': 'info', 'a': ('1', 'Drill', 'hold: chips and digs'), 'b': ('W A S D', 'move')},
+        {'type': 'info', 'a': ('2', 'Rifle', 'hitscan, small hole'), 'b': ('Space', 'jump')},
+        {'type': 'info', 'a': ('3', 'Grenade launcher', 'arcing shell, medium blast'), 'b': ('V', 'fly')},
+        {'type': 'info', 'a': ('4', 'Rocket launcher', 'fast, big blast'), 'b': ('Mouse', 'look')},
+        {'type': 'info', 'a': ('5', 'Melting laser', 'hold: melts what it touches'), 'b': ('Left click', 'fire weapon')},
+        {'type': 'info', 'a': ('6', 'Demo charge', 'sticks to what it hits'), 'b': ('Right click', 'detonate charges')},
+        {'type': 'info', 'a': None, 'b': ('R', 'reset map and damage')},
+        {'type': 'info', 'a': None, 'b': ('F', 'pause')},
+        {'type': 'info', 'a': None, 'b': ('G', 'debug + integrity (V hides text)')},
+        {'type': 'info', 'a': None, 'b': ('Tab', 'settings')},
+        {'type': 'info', 'a': None, 'b': ('F5', 'benchmark')},
     ]),
 ]
 
 def default_settings():
     return {'cache_chunks': True, 'render_distance': RENDER_DIST, 'fov': FOV, 'show_hud': False,
             'fps_limit': TARGET_FPS, 'debris_yield': 1.0, 'debris_size': 1.0, 'dirt_cubes': 10,
-            'dirt_cube_size': 1.0, 'cube_sleep_time': 1.0}
+            'dirt_cube_size': 1.0, 'cube_sleep_time': 1.0, 'debris_on': True, 'debris_amount': 100,
+            'struct_res': 2, 'gpu_physics': True}
 
 class TabMenu:
     """Cursor state for the settings panel: which tab, and which row in it."""
@@ -1240,7 +1279,8 @@ class TabMenu:
         self.drag = None     # row index of a slider being dragged with the mouse
 
     def rows(self):
-        return SETTINGS_TABS[self.tab][1]
+        """Rows of the current tab that are shown now. A row with 'when' only shows while that setting is on."""
+        return [r for r in SETTINGS_TABS[self.tab][1] if r.get('when') is None or self.settings[r['when']]]
 
     def selectable(self):
         return [i for i, r in enumerate(self.rows())
@@ -1266,6 +1306,13 @@ class TabMenu:
             self.settings[r['key']] = max(r['min'], min(r['max'], v))
         elif r['type'] == 'toggle':
             self.settings[r['key']] = not self.settings[r['key']]
+            self.fix_row()
+
+    def fix_row(self):
+        """Move the cursor off a row that has just been hidden."""
+        idx = self.selectable()
+        if idx and self.row not in idx:
+            self.row = idx[0]
 
     def activate(self):
         r = self.rows()[self.row]
@@ -1434,6 +1481,9 @@ class SettingsPanel(Overlay):
             if row['type'] == 'header':
                 y += 44
                 continue
+            if row['type'] == 'info':
+                y += 30
+                continue
             if row.get('locked'):          # locked rows have no click targets at all
                 y += 70
                 continue
@@ -1551,6 +1601,17 @@ class SettingsPanel(Overlay):
                 y += 44
                 continue
 
+            if row['type'] == 'info':
+                if row['a']:
+                    k, name, note = row['a']
+                    s.blit(self.f_label.render(k, True, (255, 220, 120)), (32, y))
+                    s.blit(self.f_label.render(name, True, UI_TEXT), (62, y))
+                    s.blit(self.f_help.render(note, True, UI_DIM), (270, y + 4))
+                k, d = row['b']
+                s.blit(self.f_value.render(k, True, (255, 220, 120)), (610, y + 1))
+                s.blit(self.f_value.render(d, True, UI_TEXT), (750, y + 1))
+                y += 30
+                continue
             if i == menu.row:
                 pygame.draw.rect(s, UI_ROW_SEL, (16, y - 8, self.w - 32, 66), border_radius=6)
             locked = bool(row.get('locked'))
@@ -1722,17 +1783,21 @@ class PerfHud:
         shown = f"{label}   {values[-1]:.1f}" if values else label
         parts.append(self._text(x + 8, y + 4, shown, color))
 
-    def _build(self, perf, poller):
+    def _build(self, perf, poller, show_text=True):
         """Build the HUD's triangles from the current stats. This is the expensive Python part,
         so it only runs every HUD_REBUILD_S seconds."""
-        parts = [self._rect(0, 0, HUD_W, HUD_H, (20, 20, 28, 200)),
-                 self._outline(0, 0, HUD_W, HUD_H, (120, 120, 140, 255))]
+        box_h = HUD_H if show_text else 136                  # graphs only: the box shrinks to fit them
+        parts = [self._rect(0, 0, HUD_W, box_h, (20, 20, 28, 200)),
+                 self._outline(0, 0, HUD_W, box_h, (120, 120, 140, 255))]
         self._graph(parts, (8, 8, 244, 120), list(perf.frame_ms), 40.0,
                     (110, 200, 255, 255), "Frame ms")
         self._graph(parts, (258, 8, 244, 120), list(perf.cpu_ms), 40.0,
                     (150, 230, 140, 255), "CPU work ms", ref=1000.0 / 60.0)
         self._graph(parts, (508, 8, 244, 120), list(perf.gpu_ms), 40.0,
                     (255, 170, 90, 255), "GPU compute ms")
+
+        if not show_text:
+            return np.vstack(parts).astype(np.float32)
 
         def fmt(v, unit=""):
             return "n/a" if v is None else f"{v:.0f}{unit}"
@@ -1765,11 +1830,12 @@ class PerfHud:
                                     (160, 160, 170, 255)))
         return np.vstack(parts).astype(np.float32)
 
-    def draw(self, perf, poller):
+    def draw(self, perf, poller, show_text=True):
         # Rebuild the vertices only every HUD_REBUILD_S seconds; in between, the stored ones are drawn.
         now = time.perf_counter()
-        if self._verts_count == 0 or now - self._built_at >= HUD_REBUILD_S:
-            verts = self._build(perf, poller)
+        if self._verts_count == 0 or now - self._built_at >= HUD_REBUILD_S or show_text != getattr(self, '_shown_text', True):
+            self._shown_text = show_text
+            verts = self._build(perf, poller, show_text)
             self._verts_count = len(verts)
             self._built_at = now
             gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
@@ -1856,7 +1922,7 @@ def _box_hits_solid(world, x, y, z):
         for dx, dz in ring:
             if _density_at(world, x + dx, y_s, z + dz) > 0.0:
                 return True
-    return False
+    return STRUCTS.hits_box(x, y, z, r, h)          # structures and loose bodies are solid too
 
 class PlayerController:
     EPS = 1e-4
@@ -2002,7 +2068,7 @@ void main() {
 # ═══════════════════════════════════════════════
 #  PARTICLES (dust, smoke, fire): from particles.py
 # ═══════════════════════════════════════════════
-CONFIG = {'enabled': True, 'particle_cap': DEBRIS_MAX}
+CONFIG = {'enabled': True, 'particle_cap': DEBRIS_MAX, 'debris_on': True, 'debris_amount': 1.0}
 BLOCK_RGB = np.full((256, 3), 0.6, dtype=np.float32)
 
 FX_CAP = 9000
@@ -2028,18 +2094,39 @@ class ParticlePool:
         for k in self._F1:
             setattr(self, k, np.zeros(FX_CAP, np.float32))
 
+    def remove_kind(self, kind):
+        """Delete every particle of one kind (used to clear dust when debris is turned off)."""
+        if self.n == 0:
+            return
+        keep = np.nonzero(self.kind[:self.n] != kind)[0]
+        m = len(keep)
+        for nm in self._ALL:
+            a = getattr(self, nm)
+            a[:m] = a[keep]
+        self.n = m
+
     def add(self, kind, P, V, life, s0, s1, col, a0, drag, buoy):
         """Spawn particles at P (k,3). V, life, s0, s1, col, a0, drag, buoy broadcast to k."""
-        if not CONFIG['enabled']:
-            return 0
+        if not CONFIG['enabled'] or kind in (FX_FIRE, FX_SMOKE):
+            return 0                      # fire and smoke are switched off; only dust remains
         P = np.asarray(P, np.float32).reshape(-1, 3)
         k0 = len(P)
-        k = min(k0, min(FX_CAP, int(CONFIG['particle_cap'])) - self.n)
+        sel = None
+        if kind == FX_DUST:
+            if not CONFIG['debris_on']:
+                return 0
+            if CONFIG['debris_amount'] < 1.0:
+                sel = np.nonzero(_rng.random(k0) < CONFIG['debris_amount'])[0]
+                P = P[sel]
+        k = min(len(P), min(FX_CAP, int(CONFIG['particle_cap'])) - self.n)
         if k <= 0:
             return 0
 
         def f(x, extra=()):
-            return np.broadcast_to(np.asarray(x, dtype=np.float32), (k0,) + extra)[:k]
+            a = np.broadcast_to(np.asarray(x, dtype=np.float32), (k0,) + extra)
+            if sel is not None:
+                a = a[sel]
+            return a[:k]
 
         s = self.n
         e = s + k
@@ -2173,29 +2260,13 @@ def fx_fireball(c, r):
 
 
 def fx_explosion(centre, radius, broken, block_rgb=None):
-    """Fireball, smoke column and dust off every broken block.
-    broken: list of (power, x, y, z, block, dx, dy, dz); pass [] for a bare flash or puff.
+    """Dust off every broken block (no fire or smoke).
+    broken: list of (power, x, y, z, block, dx, dy, dz); pass [] for nothing.
     block_rgb: optional (256, 3) colour table, defaults to BLOCK_RGB."""
     table = BLOCK_RGB if block_rgb is None else block_rgb
     c = np.asarray(centre, np.float32)
     r = float(radius)
     R = _rng
-    if r >= 1.5:
-        fx_fireball(c, r)
-    nf = int(2.2 * r * r + 2)
-    d = _unit_dirs(nf)
-    s0 = R.uniform(0.4, 0.8, nf) * (0.5 + 0.25 * r)
-    V = d * R.uniform(1.0, 4.0, (nf, 1)) * (0.6 + 0.3 * r)
-    V[:, 1] += 1.0
-    PARTS.add(FX_FIRE, c + d * ((R.random(nf) ** (1 / 3)) * r * 0.35)[:, None], V,
-              R.uniform(0.35, 0.9, nf) * (0.7 + 0.06 * r), s0, s0 * 2.2, 1.0, 1.0, 2.2, 2.5)
-    ns = int(1.2 * r * r + 1)
-    d = _unit_dirs(ns)
-    s0 = R.uniform(0.5, 0.9, ns) * (0.6 + 0.3 * r)
-    V = d * R.uniform(0.5, 2.0, (ns, 1)) * (0.5 + 0.25 * r)
-    V[:, 1] += R.uniform(1.0, 2.5, ns)
-    PARTS.add(FX_SMOKE, c + d * ((R.random(ns) ** (1 / 3)) * r * 0.5)[:, None], V,
-              R.uniform(2.0, 4.0, ns), s0, s0 * 3.0, R.uniform(0.08, 0.22, (ns, 1)), 0.5, 1.0, 1.3)
     if broken:
         m = min(len(broken), int(10 * r) + 8)
         sel = R.choice(len(broken), m, replace=False) if len(broken) > m else range(len(broken))
@@ -2206,10 +2277,10 @@ def fx_explosion(centre, radius, broken, block_rgb=None):
         dirs = np.array([(t[5], t[6], t[7]) for t in b], np.float64)
         dirs /= np.maximum(np.linalg.norm(dirs, axis=1, keepdims=True), 0.1)
         V = dirs * R.uniform(1.5, 5.0, (m, 1))
-        V[:, 1] += R.uniform(0.5, 2.5, m)
+        V[:, 1] += R.uniform(0.0, 0.6, m)                         # puffs no longer drift upward
         PARTS.add(FX_DUST, pts + R.uniform(-0.4, 0.4, (m, 3)), V, R.uniform(0.9, 2.0, m),
                   R.uniform(0.6, 1.0, m), R.uniform(2.0, 3.2, m),
-                  table[ids] * 0.55 + 0.30, 0.38, 2.0, 0.2)
+                  table[ids] * 0.55 + 0.30, 0.38, 2.0, 0.0)
 
 
 def fx_laser(end, d, dt, heat, burning):
@@ -2382,7 +2453,7 @@ class ParticleRenderer:
 # ═══════════════════════════════════════════════
 BODY_MAX       = 12000               # cubes alive at once; the oldest go first
 BODY_GRAVITY   = 14.0                # blocks per second squared
-BODY_MAX_FALL  = 12.0                # terminal speed, blocks per second
+BODY_MAX_FALL  = 9.0                 # terminal speed, blocks per second
 BODY_FRICTION  = 6.0                 # sideways slow-down
 
 def _sample_many(world, X, Y, Z):
@@ -2433,11 +2504,34 @@ def _corners_touching(world, P, size):
     pts[:, 1] -= np.repeat(size, 4) * 0.5
     return (_density_many(world, pts) > 0.0).reshape(m, 4)
 
+def _struct_corners(P, size):
+    """(m, 4) bool: which bottom corners sit inside a fixed structure or a loose rigid body."""
+    m = len(P)
+    out = np.zeros((m, 4), bool)
+    objs = STRUCTS.objects()
+    if m == 0 or not objs:
+        return out
+    pts = np.repeat(P, 4, axis=0)
+    off = np.array([[0.4, 0.4], [0.4, -0.4], [-0.4, 0.4], [-0.4, -0.4]])
+    s_rep = np.repeat(size, 4)
+    pts[:, 0] += np.tile(off[:, 0], m) * s_rep
+    pts[:, 2] += np.tile(off[:, 1], m) * s_rep
+    pts[:, 1] -= s_rep * 0.5
+    flat = out.reshape(-1)                     # view: writes land in out
+    for O in objs:
+        lo, hi = O.aabb()
+        near = np.nonzero(((pts >= lo - 0.05) & (pts <= hi + 0.05)).all(axis=1))[0]
+        if not len(near):
+            continue
+        sel, _, _ = O.probe(pts[near])
+        flat[near[sel]] = True
+    return out
+
 def _support(world, P, size):
     """(m, 4) bool: which bottom corners are on the ground, counting a corner that is within 0.05 above it."""
     Q = P.copy()
     Q[:, 1] -= 0.05
-    return _corners_touching(world, Q, size)
+    return _corners_touching(world, Q, size) | _struct_corners(Q, size)
 
 def _downhill(world, P, size):
     """Unit horizontal direction pointing down the slope under each cube (zero on flat ground)."""
@@ -2458,6 +2552,69 @@ def _grid_for(count):
         k += 1
     return k
 
+
+def _struct_push(P, size):
+    """For each cube whose bottom corners are inside a structure or loose body: the shortest move that takes it
+    out (along the nearest exposed face's normal), and which cubes needed one. Returns (push (m,3), hit (m,))."""
+    m = len(P)
+    push = np.zeros((m, 3))
+    hit = np.zeros(m, bool)
+    objs = STRUCTS.objects()
+    if m == 0 or not objs:
+        return push, hit
+    pts = np.repeat(P, 4, axis=0)
+    off = np.array([[0.4, 0.4], [0.4, -0.4], [-0.4, 0.4], [-0.4, -0.4]])
+    s_rep = np.repeat(size, 4)
+    pts[:, 0] += np.tile(off[:, 0], m) * s_rep
+    pts[:, 2] += np.tile(off[:, 1], m) * s_rep
+    pts[:, 1] -= s_rep * 0.5
+    best = np.zeros(m)
+    for O in objs:
+        lo, hi = O.aabb()
+        near = np.nonzero(((pts >= lo - 0.05) & (pts <= hi + 0.05)).all(axis=1))[0]
+        if not len(near):
+            continue
+        sel, depth, normal = O.probe(pts[near])
+        if not len(sel):
+            continue
+        cube = near[sel] // 4
+        for c, dp, nm in zip(cube.tolist(), depth.tolist(), normal):
+            if dp > best[c]:
+                best[c] = dp
+                push[c] = nm * (dp + 0.01)
+                hit[c] = True
+    return push, hit
+
+def _terrain_push(world, P, size):
+    """For cubes with the underside middle or any bottom corner inside the ground: a move along the density gradient
+    at the deepest of those points. Catches cubes wedged against a wall by one corner. Returns (push (m,3), hit (m,))."""
+    m = len(P)
+    off = np.array([[0.0, 0.0], [0.4, 0.4], [0.4, -0.4], [-0.4, 0.4], [-0.4, -0.4]])
+    pts = np.repeat(P, 5, axis=0)
+    s5 = np.repeat(size, 5)
+    pts[:, 0] += np.tile(off[:, 0], m) * s5
+    pts[:, 2] += np.tile(off[:, 1], m) * s5
+    pts[:, 1] -= s5 * 0.5
+    d = _density_many(world, pts).reshape(m, 5)
+    k = np.argmax(d, axis=1)
+    dm = d[np.arange(m), k]
+    hit = dm > 0.0
+    push = np.zeros_like(P)
+    if not hit.any():
+        return push, hit
+    Q = pts.reshape(m, 5, 3)[np.arange(m), k][hit]
+    e = 0.25
+    g = np.stack([(_density_many(world, Q + np.array([e, 0, 0])) - _density_many(world, Q - np.array([e, 0, 0]))),
+                  (_density_many(world, Q + np.array([0, e, 0])) - _density_many(world, Q - np.array([0, e, 0]))),
+                  (_density_many(world, Q + np.array([0, 0, e])) - _density_many(world, Q - np.array([0, 0, e])))],
+                 axis=1) / (2 * e)
+    gn = np.linalg.norm(g, axis=1)
+    ok = gn > 1e-3
+    dirn = np.where(ok[:, None], -g / np.maximum(gn, 1e-9)[:, None], np.array([0.0, 1.0, 0.0]))
+    dist = np.where(ok, dm[hit] / np.maximum(gn, 1e-9), 0.3) + 0.005
+    push[hit] = dirn * dist[:, None]
+    return push, hit
+
 class DirtCubes:
     """Mini dirt cubes. Simulated as numpy arrays: gravity, collision with the smooth terrain, and sleep
     for cubes at rest. Cubes do not collide with each other, so they can overlap."""
@@ -2471,10 +2628,16 @@ class DirtCubes:
         self.shade = np.zeros(0, np.float64)
         self.awake = np.zeros(0, bool)
         self.still = np.zeros(0, np.float64)            # seconds each cube has been at rest
+        self.col = np.zeros((0, 3), np.float64)         # colour of each cube
 
     @property
     def n(self):
         return len(self.pos)
+
+    def wake_all(self):
+        """Wake every cube so it re-checks what it rests on (called when the ground or a structure changes)."""
+        self.awake[:] = True
+        self.still[:] = 0.0
 
     def spawn(self, world, cell_groups, per_block, size_scale=1.0):
         """Split each dug block into `per_block` cubes. Nothing is thrown: the cubes start at rest in the
@@ -2482,6 +2645,9 @@ class DirtCubes:
         size_scale shrinks each cube inside its slot (1.0 fills the slot)."""
         groups = [np.asarray(g, np.float64).reshape(-1, 3) for g in cell_groups if len(g)]
         per_block = int(max(0, min(100, round(per_block))))
+        if not CONFIG['debris_on']:
+            return
+        per_block = int(round(per_block * CONFIG['debris_amount']))
         if not groups or per_block == 0:
             return
         k = _grid_for(per_block)
@@ -2494,7 +2660,8 @@ class DirtCubes:
         P = np.concatenate(P)
         side = float(np.clip(size_scale, 0.1, 1.0)) / k
         sizes = np.full(len(P), side)
-        free = (_density_many(world, P) <= 0.0) & ~_corners_touching(world, P, sizes).any(axis=1)
+        free = ((_density_many(world, P) <= 0.0) & ~_corners_touching(world, P, sizes).any(axis=1)
+                & ~_struct_corners(P, sizes).any(axis=1))
         P, sizes = P[free], sizes[free]
         if len(P) == 0:
             return
@@ -2504,22 +2671,69 @@ class DirtCubes:
         self.shade = np.concatenate([self.shade, _rng.uniform(0.9, 1.1, len(P))])
         self.awake = np.concatenate([self.awake, np.ones(len(P), bool)])
         self.still = np.concatenate([self.still, np.zeros(len(P))])
+        self.col = np.concatenate([self.col, np.tile(np.array(COLORS[DIRT], np.float64), (len(P), 1))])
         if self.n > BODY_MAX:
             cut = self.n - BODY_MAX
             self.pos, self.vel = self.pos[cut:], self.vel[cut:]
             self.size, self.shade, self.awake = self.size[cut:], self.shade[cut:], self.awake[cut:]
             self.still = self.still[cut:]
+            self.col = self.col[cut:]
 
-    def _separate(self, passes=2):
+    def spawn_chunks(self, P, V, sizes, rgb, world=None):
+        """Chunks thrown from a broken structure: positions P, velocities V, sizes (disc diameters) and colours."""
+        if not CONFIG['debris_on']:
+            return
+        P = np.asarray(P, np.float64).reshape(-1, 3)
+        V = np.asarray(V, np.float64).reshape(-1, 3)
+        sizes = np.broadcast_to(np.asarray(sizes, np.float64), (len(P),))
+        rgb = np.broadcast_to(np.asarray(rgb, np.float64), (len(P), 3))
+        if CONFIG['debris_amount'] < 1.0:
+            sel = _rng.random(len(P)) < CONFIG['debris_amount']
+            P, V, sizes, rgb = P[sel], V[sel], sizes[sel], rgb[sel]
+        if world is not None and len(P):
+            # A chunk that starts inside the ground or inside what is left of the structure was the source of the
+            # "float up through the pillar" cubes. Nudge it up once, and drop it if it still starts inside something.
+            def clear(Q, S):
+                return (_density_many(world, Q) <= 0.0) & ~_corners_touching(world, Q, S).any(axis=1) \
+                       & ~_struct_corners(Q, S).any(axis=1)
+            ok = clear(P, sizes)
+            if not ok.all():
+                P = P.copy()
+                P[~ok, 1] += 0.15
+                ok = clear(P, sizes)
+            P, V, sizes, rgb = P[ok], V[ok], sizes[ok], rgb[ok]
+        k = len(P)
+        if k == 0:
+            return
+        self.pos = np.concatenate([self.pos, P])
+        self.vel = np.concatenate([self.vel, np.asarray(V, np.float64).reshape(-1, 3)])
+        self.size = np.concatenate([self.size, np.broadcast_to(np.asarray(sizes, np.float64), (k,))])
+        self.shade = np.concatenate([self.shade, np.ones(k)])
+        self.awake = np.concatenate([self.awake, np.ones(k, bool)])
+        self.still = np.concatenate([self.still, np.zeros(k)])
+        self.col = np.concatenate([self.col, np.broadcast_to(np.asarray(rgb, np.float64), (k, 3))])
+        if self.n > BODY_MAX:
+            cut = self.n - BODY_MAX
+            self.pos, self.vel = self.pos[cut:], self.vel[cut:]
+            self.size, self.shade, self.awake = self.size[cut:], self.shade[cut:], self.awake[cut:]
+            self.still = self.still[cut:]
+            self.col = self.col[cut:]
+
+    def _separate(self, passes=3, dt=1.0 / 60.0):
         """Round cube against round cube. Each cube is treated as a sphere with radius half its size.
         Overlapping pairs are pushed apart along the line between their centres. Sleeping cubes never
         move; when one of a pair is asleep, the awake one takes the whole correction. Motion that drives
         the pair into each other is removed, so piles settle instead of jittering."""
+        self._contact = np.zeros(self.n, bool)                    # cubes that touched another cube this frame
         if self.n < 2:
             return
         M = 1 << 20
         OFF = 1 << 19
         SEP_SLOP = 0.003
+        k = max(1.0, dt * 60.0)          # slow frames fall further, so they are allowed to correct further
+        SEP_SOFT = min(1.0, 0.35 * k)    # share of an overlap fixed per pass
+        SEP_MAX_STEP = 0.02 * k          # most a pair is moved per pass, in blocks
+        SEP_CUBE_CAP = 0.03 * k          # most one cube is moved per pass, however many neighbours push it
         for _ in range(passes):
             cell = float(self.size.max())
             ci = np.floor(self.pos / cell).astype(np.int64) + OFF
@@ -2565,23 +2779,42 @@ class DirtCubes:
             wI = np.where(aI & aJ, 0.5, np.where(aI, 1.0, 0.0))     # share of the push each cube takes
             wJ = 1.0 - wI
 
+            # Correct only part of the overlap, capped per pass. Fixing it all at once shoved a landing cube
+            # up and sideways in one frame, which is what looked like a bounce.
+            push = np.minimum(depth * SEP_SOFT, SEP_MAX_STEP)
             corr = np.zeros_like(self.pos)
-            np.add.at(corr, J, n * (depth * wJ)[:, None])
-            np.add.at(corr, I, -n * (depth * wI)[:, None])
+            np.add.at(corr, J, n * (push * wJ)[:, None])
+            np.add.at(corr, I, -n * (push * wI)[:, None])
+            mag = np.linalg.norm(corr, axis=1)
+            corr *= np.minimum(1.0, SEP_CUBE_CAP / np.maximum(mag, 1e-9))[:, None]    # a cube in a crowd moves at most this much
             self.pos += corr
 
             strong = depth > 0.02
             self.still[np.concatenate([I[strong], J[strong]])] = 0.0
+            touched = np.unique(np.concatenate([I[aI], J[aJ]]))
+            self._contact[touched] = True
+            self.vel[touched] *= 0.85                                  # contact friction: bleeds off the energy that makes hops
 
             # Remove only the velocity that drives the pair into each other.
             vI = np.einsum('ij,ij->i', self.vel[I], n)
             vJ = np.einsum('ij,ij->i', self.vel[J], n)
+            # Every contact used the same pre-correction velocity, so a cube resting on two cubes had its fall
+            # cancelled twice and came out moving UP. Each contact now takes only its share (1 / contacts), which
+            # can never remove more than the approach speed.
+            deg = (np.bincount(I, minlength=self.n) + np.bincount(J, minlength=self.n)).astype(np.float64)
             kill_I = aI & (vI > 0)
             kill_J = aJ & (vJ < 0)
-            np.add.at(self.vel, I[kill_I], -(vI[kill_I])[:, None] * n[kill_I])
-            np.add.at(self.vel, J[kill_J], -(vJ[kill_J])[:, None] * n[kill_J])
+            np.add.at(self.vel, I[kill_I], -(vI[kill_I] / deg[I[kill_I]])[:, None] * n[kill_I])
+            np.add.at(self.vel, J[kill_J], -(vJ[kill_J] / deg[J[kill_J]])[:, None] * n[kill_J])
 
     def update(self, world, dt, sleep_time=1.0):
+        cap = int(BODY_MAX * CONFIG['debris_amount']) if CONFIG['debris_on'] else 0
+        if self.n > cap:
+            cut = self.n - cap
+            self.pos, self.vel = self.pos[cut:], self.vel[cut:]
+            self.size, self.shade, self.awake = self.size[cut:], self.shade[cut:], self.awake[cut:]
+            self.still = self.still[cut:]
+            self.col = self.col[cut:]
         if self.n == 0:
             return
         dt = min(dt, 0.05)
@@ -2589,6 +2822,7 @@ class DirtCubes:
         if len(aw):
             V = self.vel[aw]
             P = self.pos[aw]
+            P_start = P.copy()
             V[:, 1] = np.maximum(V[:, 1] - BODY_GRAVITY * dt, -BODY_MAX_FALL)
             kf = math.exp(-BODY_FRICTION * dt)
             V[:, 0] *= kf
@@ -2597,14 +2831,42 @@ class DirtCubes:
             steps = int(min(16, max(1, math.ceil(top * dt * 16))))
             sdt = dt / steps
             size = self.size[aw]
+            # A cube that ended up inside a structure (a blast throws pieces out of one) is lifted out,
+            # otherwise every move is blocked and it hangs there.
+            for _ in range(4):
+                push, stuck = _struct_push(P, size)
+                if not stuck.any():
+                    break
+                L = np.linalg.norm(push[stuck], axis=1)
+                step = push[stuck] * (np.minimum(L, 0.1) / np.maximum(L, 1e-9))[:, None]   # out the nearest face, not always up
+                P[stuck] += step
+                nrm = step / np.maximum(np.linalg.norm(step, axis=1, keepdims=True), 1e-9)
+                into = np.minimum(np.einsum('ij,ij->i', V[stuck], nrm), 0.0)
+                V[stuck] -= into[:, None] * nrm                                           # stop only the motion into the surface
+            stuck = _struct_corners(P, size).any(axis=1)
+            if stuck.any():
+                P[stuck, 1] += 0.1 * size[stuck]                                          # last resort if the normals fail
+            # A cube whose centre is inside the ground (a push from a neighbour, or a blast that moved the surface)
+            # is moved back out along the density gradient. It used to stay stuck there for good.
+            for _ in range(2):
+                tpush, tin = _terrain_push(world, P, size)
+                if not tin.any():
+                    break
+                L = np.linalg.norm(tpush[tin], axis=1)
+                P[tin] += tpush[tin] * (np.minimum(L, 0.08) / np.maximum(L, 1e-9))[:, None]
+                V[tin, 1] = np.maximum(V[tin, 1], 0.0)                                   # stop it sinking back in
             for _ in range(steps):
                 for axis in (1, 0, 2):
                     new = P.copy()
                     new[:, axis] += V[:, axis] * sdt
                     if axis == 1:
-                        blocked = _corners_touching(world, new, size).any(axis=1)   # any bottom corner in terrain
+                        under = new.copy()
+                        under[:, 1] -= size * 0.5
+                        blocked = (_corners_touching(world, new, size)
+                                   | _struct_corners(new, size)).any(axis=1)   # any bottom corner in terrain or a structure
+                        blocked |= _density_many(world, under) > 0.0            # ...or the middle of its underside (a bump between the corners)
                     else:
-                        blocked = _density_many(world, new) > 0.0
+                        blocked = (_density_many(world, new) > 0.0) | _struct_corners(new, size).any(axis=1)
                     go = ~blocked
                     P[go] = new[go]
                     V[blocked, axis] = 0.0
@@ -2619,11 +2881,33 @@ class DirtCubes:
             # Hard sleep timer: a cube that stays still for sleep_time seconds goes to sleep for good.
             self.pos[aw] = P
             self.vel[aw] = V
-            self._separate()                                       # pushes cubes apart, stops motion into each other
+            self._separate(dt=dt)
+            # Separation knows nothing about the ground, so a pile pressing down can push its bottom cubes into it.
+            # Bring any cube whose underside went into the surface back out.
+            for _ in range(2):
+                tp, tin = _terrain_push(world, self.pos[aw], size)
+                if not tin.any():
+                    break
+                L = np.linalg.norm(tp[tin], axis=1)
+                self.pos[aw[tin]] += tp[tin] * (np.minimum(L, 0.1) / np.maximum(L, 1e-9))[:, None]
+                self.vel[aw[tin], 1] = np.maximum(self.vel[aw[tin], 1], 0.0)
+            # Static friction: a cube that is touching others and already moving slowly stops sliding sideways, so a
+            # pile of round-ish cubes stops creeping and can go to sleep.
+            ct = self._contact[aw]
+            crawl = np.linalg.norm(self.vel[aw], axis=1) < 0.35
+            stick = aw[ct & crawl]
+            self.vel[stick, 0] = 0.0
+            self.vel[stick, 2] = 0.0
+            moved_speed = np.linalg.norm(self.pos[aw] - P_start, axis=1) / max(dt, 1e-6)   # real movement this frame, pushes included                                       # pushes cubes apart, stops motion into each other
             Vn = self.vel[aw]
-            still_now = np.abs(Vn).max(axis=1) < 0.05              # judged after separation, so stacked cubes can rest
+            still_now = (np.abs(Vn).max(axis=1) < 0.12) & (moved_speed < 0.25)   # crawling AND not being shoved around
             self.vel[aw[still_now]] = 0.0
             self.still[aw] = np.where(still_now, self.still[aw] + dt, 0.0)
+            ready = np.nonzero(still_now & (self.still[aw] >= sleep_time))[0]          # about to fall asleep
+            if len(ready):
+                held = _support(world, self.pos[aw[ready]], size[ready]).any(axis=1) | ct[ready]
+                lost = ready[~held]                                                    # nothing under it: keep it awake
+                self.still[aw[lost]] = 0.0
             asleep = self.still[aw] >= sleep_time
             self.awake[aw[asleep]] = False
         keep = self.pos[:, 1] > -4.0                         # drop cubes that fell out of the world
@@ -2631,13 +2915,13 @@ class DirtCubes:
             self.pos, self.vel = self.pos[keep], self.vel[keep]
             self.size, self.shade, self.awake = self.size[keep], self.shade[keep], self.awake[keep]
             self.still = self.still[keep]
+            self.col = self.col[keep]
 
     def instances(self):
         """Per cube: centre x, y, z, colour r, g, b, and side length."""
-        base = np.array(COLORS[DIRT], np.float32)
         out = np.empty((self.n, 7), np.float32)
         out[:, :3] = self.pos
-        out[:, 3:6] = base[None, :] * self.shade[:, None].astype(np.float32)
+        out[:, 3:6] = self.col.astype(np.float32) * self.shade[:, None].astype(np.float32)
         out[:, 6] = self.size
         return out
 
@@ -2652,20 +2936,19 @@ def cube_slot_lo(k):
 
 _DISC_VERT = """
 #version 330 core
-layout(location = 0) in vec2 aCorner;     // quad corner, -0.5..0.5
-layout(location = 1) in vec3 aInstPos;    // disc centre
-layout(location = 2) in vec3 aInstCol;    // disc colour
-layout(location = 3) in float aInstSize;  // disc diameter
+layout(location = 0) in vec3 aPos;        // unit cube vertex, -0.5..0.5
+layout(location = 1) in vec3 aInstPos;    // cube centre
+layout(location = 2) in vec3 aInstCol;    // cube colour
+layout(location = 3) in float aInstSize;  // cube side length
+layout(location = 4) in vec3 aNrm;        // face normal
 uniform mat4 uVP;
-uniform vec3 uRight;                      // camera right, for billboarding
-uniform vec3 uUp;                         // camera up, for billboarding
 uniform float uLight;
 out vec3 vCol;
-out vec2 vUV;
+out vec3 vNrm;
 void main() {
-    vec3 p = aInstPos + (uRight * aCorner.x + uUp * aCorner.y) * aInstSize;
+    vec3 p = aInstPos + aPos * aInstSize;
     vCol = aInstCol * uLight;
-    vUV = aCorner;
+    vNrm = aNrm;
     gl_Position = uVP * vec4(p, 1.0);
 }
 """
@@ -2673,20 +2956,32 @@ void main() {
 _DISC_FRAG = """
 #version 330 core
 in vec3 vCol;
-in vec2 vUV;
+in vec3 vNrm;
 out vec4 fragColor;
 void main() {
-    float r = length(vUV) * 2.0;              // 0 at centre, 1 at the rim
-    if (r > 1.0) discard;                     // round disc
-    float dome = 0.80 + 0.20 * (1.0 - r * r); // slight highlight toward the middle
-    fragColor = vec4(vCol * dome, 1.0);
+    vec3 n = normalize(vNrm);
+    vec3 sun = normalize(vec3(0.45, 0.80, 0.35));
+    float shade = 0.38 + 0.30 * (0.5 + 0.5 * n.y) + 0.42 * max(dot(n, sun), 0.0);
+    fragColor = vec4(vCol * shade, 1.0);
 }
 """
 
-_DISC_CORNERS = np.array([
-    [-0.5, -0.5], [0.5, -0.5], [0.5, 0.5],
-    [-0.5, -0.5], [0.5, 0.5], [-0.5, 0.5],
-], dtype=np.float32)
+
+def _cube_mesh():
+    """36 vertices of a unit cube centred on the origin: position then face normal."""
+    faces = [((1, 0, 0), (0, 1, 0), (0, 0, 1)), ((-1, 0, 0), (0, 0, 1), (0, 1, 0)),
+             ((0, 1, 0), (0, 0, 1), (1, 0, 0)), ((0, -1, 0), (1, 0, 0), (0, 0, 1)),
+             ((0, 0, 1), (1, 0, 0), (0, 1, 0)), ((0, 0, -1), (0, 1, 0), (1, 0, 0))]
+    v = []
+    for n, u, w in faces:
+        n, u, w = (np.array(t, np.float32) for t in (n, u, w))
+        c = [n * 0.5 + (-u - w) * 0.5, n * 0.5 + (u - w) * 0.5, n * 0.5 + (u + w) * 0.5, n * 0.5 + (-u + w) * 0.5]
+        for i in (0, 1, 2, 0, 2, 3):
+            v.append(np.concatenate([c[i], n]))
+    return np.array(v, np.float32)
+
+
+_DISC_CORNERS = _cube_mesh()       # (kept under the old name: the mesh the renderer instances)
 
 class DirtBodyRenderer:
     """Draws every dirt cube as a camera-facing disc with one instanced call."""
@@ -2705,7 +3000,9 @@ class DirtBodyRenderer:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_c)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, _DISC_CORNERS.nbytes, _DISC_CORNERS, gl.GL_STATIC_DRAW)
         gl.glEnableVertexAttribArray(0)
-        gl.glVertexAttribPointer(0, 2, gl.GL_FLOAT, gl.GL_FALSE, 8, ctypes.c_void_p(0))
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 24, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(4)
+        gl.glVertexAttribPointer(4, 3, gl.GL_FLOAT, gl.GL_FALSE, 24, ctypes.c_void_p(12))
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_i)
         gl.glEnableVertexAttribArray(1)
         gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, 28, ctypes.c_void_p(0))
@@ -2738,8 +3035,1878 @@ class DirtBodyRenderer:
         gl.glBindVertexArray(self.vao)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_i)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, inst.nbytes, inst, gl.GL_STREAM_DRAW)
-        gl.glDrawArraysInstanced(gl.GL_TRIANGLES, 0, 6, n)
+        gl.glDrawArraysInstanced(gl.GL_TRIANGLES, 0, 36, n)
         gl.glBindVertexArray(0)
+
+
+# ═══════════════════════════════════════════════
+#  STRUCTURES: breakable supports, rigid bodies, solid rotating geometry
+# ═══════════════════════════════════════════════
+# A structure is a box-shaped grid of solid cells (a pillar, a wall). Each cell has a material, and
+# neighbouring cells are joined by bonds. Blasts destroy and crack cells. After each change the
+# structure is checked: every bond across a cut plane carries its share of the weight above it, and
+# a bond that is stretched or crushed past its strength breaks. A group of cells with no bond path to
+# the ground becomes a RigidBody: a solid with a position, a rotation, mass and an inertia tensor.
+# Bodies collide with the terrain, with structures and with each other, so a pillar that loses its
+# footing tips over its remaining support instead of just dropping.
+
+STRUCT_GRAVITY      = 24.0     # blocks per second squared
+STRUCT_SUBSTEPS     = 3        # physics steps per frame for each awake body
+STRUCT_SOLVER_ITERS = 8        # contact solver passes per step
+STRUCT_FRICTION     = 0.7
+STRUCT_RESTITUTION  = 0.0
+STRUCT_SLOP         = 0.03    # penetration the solver leaves alone, in blocks
+STRUCT_PUSHOUT      = 0.25     # fraction of a penetration removed per step
+STRUCT_MAX_PUSH     = 0.5      # fastest push-out speed, blocks per second
+STRUCT_MAX_CONTACTS = 10       # contacts kept per body per step
+STRUCT_SLEEP_LIN    = 0.15
+STRUCT_SLEEP_ANG    = 0.20
+STRUCT_SLEEP_TIME   = 0.6
+STRUCT_SHATTER      = 0.25     # blast strength (after falloff) that destroys a cell of hardness 1
+STRUCT_BLAST_IMPULSE = 140.0   # converts blast pressure on a body's surface to momentum
+STRUCT_CRACK_STEP   = 0.05     # seconds between rounds of bond failures, so cracks spread visibly
+STRUCT_BUDGET_S     = 0.0025   # most time per frame spent on the support checks
+STRUCT_BLAST_DIGS   = True     # a blast also carves the terrain
+STRUCT_MIN_BODY_CELLS = 6    # a loose group smaller than this crumbles into chunks instead of becoming a body
+
+# id: mass per block of volume, compressive, tensile and shear strength (force per face area), blast hardness.
+# The numbers are tuned so a 2 x 2 pillar stands whole but cracks and topples once about a third of its
+# section is gone. Blocks that are not listed behave like stone.
+STRUCT_MATERIALS = {
+    DIRT:   dict(rho=1.6, comp=1200.0,  tens=25.0,    shear=60.0,   hard=0.5),    # crumbly: weak in tension and shear
+    STONE:  dict(rho=2.4, comp=3000.0,  tens=300.0,   shear=450.0,  hard=1.0),
+    BRICK:  dict(rho=1.9, comp=1500.0,  tens=120.0,   shear=200.0,  hard=0.7),
+    PLANKS: dict(rho=0.6, comp=500.0,   tens=400.0,   shear=100.0,  hard=0.4),
+    STEEL:  dict(rho=7.8, comp=20000.0, tens=20000.0, shear=12000.0, hard=3.0),
+}
+_S_RHO   = np.full(256, STRUCT_MATERIALS[STONE]['rho'])
+_S_COMP  = np.full(256, STRUCT_MATERIALS[STONE]['comp'])
+_S_TENS  = np.full(256, STRUCT_MATERIALS[STONE]['tens'])
+_S_SHEAR = np.full(256, STRUCT_MATERIALS[STONE]['shear'])
+_S_HARD  = np.full(256, STRUCT_MATERIALS[STONE]['hard'])
+for _b, _m in STRUCT_MATERIALS.items():
+    _S_RHO[_b], _S_COMP[_b], _S_TENS[_b] = _m['rho'], _m['comp'], _m['tens']
+    _S_SHEAR[_b], _S_HARD[_b] = _m['shear'], _m['hard']
+_S_RGB = np.full((256, 3), 0.6, np.float32)
+for _b, _c in COLORS.items():
+    _S_RGB[_b] = _c
+
+# Face order everywhere: -x, +x, -y, +y, -z, +z.
+_FACE_DIRS = np.array([[-1, 0, 0], [1, 0, 0], [0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1]], np.int64)
+
+
+def _q_mul(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+    return np.array([aw * bw - ax * bx - ay * by - az * bz,
+                     aw * bx + ax * bw + ay * bz - az * by,
+                     aw * by - ax * bz + ay * bw + az * bx,
+                     aw * bz + ax * by - ay * bx + az * bw])
+
+
+def _q_mat(q):
+    w, x, y, z = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                     [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                     [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def _cross(a, b):
+    """Row-wise cross product, faster than np.cross for the small arrays the solver uses."""
+    return np.stack([a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
+                     a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
+                     a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]], axis=-1)
+
+
+def _label_cells_xp(xp, alive, bonds):
+    """Connected groups of live cells. Cells share a label when a chain of bonds joins them; empty cells
+    get a label larger than any real one."""
+    big = alive.size + 1
+    lab = xp.where(alive, xp.arange(alive.size).reshape(alive.shape), big)
+    for _ in range(alive.size + 1):
+        old = lab.copy()
+        for a in range(3):
+            lo = [slice(None)] * 3
+            hi = [slice(None)] * 3
+            lo[a], hi[a] = slice(0, -1), slice(1, None)
+            lo, hi = tuple(lo), tuple(hi)
+            m = xp.minimum(lab[lo], lab[hi])
+            b = bonds[a]
+            lab[lo] = xp.where(b, m, lab[lo])
+            lab[hi] = xp.where(b, m, lab[hi])
+        for a in range(2, -1, -1):                      # sweep back, so a label crosses the grid in few passes
+            lo = [slice(None)] * 3
+            hi = [slice(None)] * 3
+            lo[a], hi[a] = slice(0, -1), slice(1, None)
+            lo, hi = tuple(lo), tuple(hi)
+            m = xp.minimum(lab[lo], lab[hi])
+            b = bonds[a]
+            lab[hi] = xp.where(b, m, lab[hi])
+            lab[lo] = xp.where(b, m, lab[lo])
+        if bool(xp.array_equal(old, lab)):
+            break
+    return lab
+
+
+def _label_cells(alive, bonds):
+    """Connected groups of live cells (see _label_cells_xp). Large grids are labelled on the GPU when it is
+    available and switched on; any GPU error turns it off and the CPU does the work instead."""
+    global GPU_OK
+    if GFX['physics_device'] == 'gpu' and GPU_OK and alive.size >= GPU_MIN_CELLS:
+        try:
+            lab = _label_cells_xp(cp, cp.asarray(alive), [cp.asarray(b) for b in bonds])
+            return cp.asnumpy(lab)
+        except Exception as err:
+            GPU_OK = False
+            print(f"GPU physics failed ({type(err).__name__}: {err}); continuing on the CPU")
+    return _label_cells_xp(np, alive, bonds)
+
+
+def _group_mass_com(cell_mass, grp, cs):
+    """Mass and centre of mass (in the grid's own frame) of the cells selected by the boolean mask `grp`,
+    from per-axis profiles of the grid instead of listing every cell."""
+    w = np.where(grp, cell_mass, 0.0)
+    mass = float(w.sum())
+    if mass <= 0.0:
+        return 0.0, None
+    com = np.empty(3)
+    for k in range(3):
+        other = tuple(i for i in range(3) if i != k)
+        profile = w.sum(axis=other)
+        com[k] = float((profile * (np.arange(w.shape[k]) + 0.5)).sum()) * cs / mass
+    return mass, com
+
+
+class GridObject:
+    """Cells on a regular grid, in a frame that can be moved and rotated. A structure's frame stays put;
+    a rigid body's frame is its centre of mass, turned by its rotation matrix. Local coordinates of a
+    cell corner are  cs * grid_index + corner."""
+
+    def __init__(self, mat, cdmg, tint, cs):
+        self.mat = np.ascontiguousarray(mat, np.int16)
+        self.cdmg = np.ascontiguousarray(cdmg, np.float32)
+        self.tint = np.ascontiguousarray(tint, np.float32)
+        self.cs = float(cs)
+        self.heat = np.zeros(self.mat.shape, np.float32)     # 0 cold .. 1 melted; set by the laser
+        self.stress = np.zeros(self.mat.shape, np.float32)   # stress / strength per cell from the last support pass (1 = about to break)
+        self.stress_ver = 0
+        self.heated = False                                  # any cell warm? (Structure already uses 'hot' for the last blast)
+        self.frame_pos = np.zeros(3)
+        self.R = np.eye(3)
+        self.corner = np.zeros(3)
+        self.mesh_ver = 0
+        self._mesh_cache = None
+        self._aabb = None
+        self._geometry()
+
+    # ---- geometry, rebuilt after every change to the cells -------------------------------------------
+    def _geometry(self):
+        self.alive = self.mat > 0
+        nx, ny, nz = self.alive.shape
+        pad = np.pad(self.alive, 1)
+        expo = np.zeros((nx, ny, nz, 6), bool)
+        for f, (dx, dy, dz) in enumerate(_FACE_DIRS):
+            nb = pad[1 + dx:1 + dx + nx, 1 + dy:1 + dy + ny, 1 + dz:1 + dz + nz]
+            expo[..., f] = self.alive & ~nb
+        self.expo = expo
+        self.cell_mass = np.where(self.alive, _S_RHO[self.mat] * self.cs ** 3, 0.0)
+        pts, nrm = [], []
+        for f in range(6):
+            idx = np.argwhere(expo[..., f])
+            if not len(idx):
+                continue
+            ax, sg = f // 2, (1 if f % 2 else -1)
+            u, v = (ax + 1) % 3, (ax + 2) % 3
+            base = idx * 2 + 1
+            base[:, ax] = idx[:, ax] * 2 + (2 if sg > 0 else 0)
+            for du, dv in ((0, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)):
+                p = base.copy()
+                p[:, u] += du
+                p[:, v] += dv
+                pts.append(p)
+                n = np.zeros((len(p), 3))
+                n[:, ax] = sg
+                nrm.append(n)
+        if pts:
+            P = np.concatenate(pts)
+            N = np.concatenate(nrm)
+            uniq, inv = np.unique(P, axis=0, return_inverse=True)
+            inv = inv.reshape(-1)
+            sumn = np.zeros((len(uniq), 3))
+            np.add.at(sumn, inv, N)
+            ln = np.linalg.norm(sumn, axis=1, keepdims=True)
+            self.surf_g = uniq / 2.0                          # grid units
+            self.surf_n = np.where(ln > 1e-9, sumn / np.maximum(ln, 1e-9), 0.0)
+            self.surf_corner = (uniq % 2 == 0).all(axis=1)    # cell corners; the rest are face centres
+        else:
+            self.surf_g = np.zeros((0, 3))
+            self.surf_n = np.zeros((0, 3))
+            self.surf_corner = np.zeros(0, bool)
+        idx = np.argwhere(self.alive)
+        if len(idx):
+            self.cell_lo, self.cell_hi = idx.min(0), idx.max(0) + 1
+        else:
+            self.cell_lo = self.cell_hi = np.zeros(3, np.int64)
+        self.mesh_ver += 1
+        self._mesh_cache = None
+        self._aabb = None
+
+    @property
+    def surf_loc(self):
+        return self.surf_g * self.cs + self.corner
+
+    def surface_world(self):
+        return self.frame_pos + self.surf_loc @ self.R.T
+
+    def surface_normals_world(self):
+        return self.surf_n @ self.R.T
+
+    def aabb(self):
+        """World bounds (lo, hi) of the live cells. Cached until the cells or the pose change."""
+        if self._aabb is not None:
+            return self._aabb
+        if not self.alive.any():
+            self._aabb = (self.frame_pos.copy(), self.frame_pos.copy())
+            return self._aabb
+        c = np.array([[x, y, z] for x in (self.cell_lo[0], self.cell_hi[0])
+                      for y in (self.cell_lo[1], self.cell_hi[1])
+                      for z in (self.cell_lo[2], self.cell_hi[2])], np.float64)
+        w = self.frame_pos + (c * self.cs + self.corner) @ self.R.T
+        self._aabb = (w.min(0), w.max(0))
+        return self._aabb
+
+    def velocity_at(self, P):
+        return np.zeros((len(P), 3))
+
+    # ---- where is solid -----------------------------------------------------------------------------
+    def probe(self, Pw):
+        """World points -> (indices of points inside a live cell, depth to the nearest exposed face, outward
+        normal of that face in world space)."""
+        q = ((Pw - self.frame_pos) @ self.R - self.corner) / self.cs
+        ij = np.floor(q).astype(np.int64)
+        nx, ny, nz = self.alive.shape
+        ok = (ij >= 0).all(axis=1) & (ij[:, 0] < nx) & (ij[:, 1] < ny) & (ij[:, 2] < nz)
+        sel = np.nonzero(ok)[0]
+        if not len(sel):
+            return sel, None, None
+        c = ij[sel]
+        live = self.alive[c[:, 0], c[:, 1], c[:, 2]]
+        sel, c = sel[live], c[live]
+        if not len(sel):
+            return sel, None, None
+        f = q[sel] - c
+        dist = np.stack([f[:, 0], 1 - f[:, 0], f[:, 1], 1 - f[:, 1], f[:, 2], 1 - f[:, 2]], axis=1)
+        ex = self.expo[c[:, 0], c[:, 1], c[:, 2]]
+        masked = np.where(ex, dist, np.inf)
+        k = np.argmin(masked, axis=1)
+        buried = ~np.isfinite(masked[np.arange(len(k)), k])           # no exposed face: use the nearest face
+        if buried.any():
+            k[buried] = np.argmin(dist[buried], axis=1)
+        depth = dist[np.arange(len(k)), k] * self.cs
+        normal = _FACE_DIRS[k].astype(np.float64) @ self.R.T
+        return sel, depth, normal
+
+    # ---- mesh ---------------------------------------------------------------------------------------
+    def mesh(self, mode=None):
+        """(n, 9) float32 vertices, 6 per exposed face: position in the frame, normal, colour."""
+        if mode is None and self._mesh_cache is not None:
+            return self._mesh_cache
+        out = []
+        cs = self.cs
+        for f in range(6):
+            idx = np.argwhere(self.expo[..., f])
+            if not len(idx):
+                continue
+            ax, sg = f // 2, (1.0 if f % 2 else -1.0)
+            u, v = (ax + 1) % 3, (ax + 2) % 3
+            base = idx.astype(np.float64)
+            base[:, ax] += 1.0 if sg > 0 else 0.0
+            corners = []
+            for du, dv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                p = base.copy()
+                p[:, u] += du
+                p[:, v] += dv
+                corners.append(p)
+            order = (0, 1, 2, 0, 2, 3) if sg > 0 else (0, 2, 1, 0, 3, 2)
+            tri = np.stack([corners[o] for o in order], axis=1)          # (n, 6, 3)
+            pos = tri * cs + self.corner
+            ii = (idx[:, 0], idx[:, 1], idx[:, 2])
+            col = _S_RGB[self.mat[ii]] * self.tint[ii][:, None]
+            dm = np.clip(self.cdmg[ii], 0.0, 1.0)[:, None]
+            col = col * (1.0 - 0.6 * dm) + np.array([0.20, 0.18, 0.17], np.float32) * (0.6 * dm)
+            hm = np.clip(self.heat[ii], 0.0, 1.0)[:, None]
+            col = col * (1.0 - hm) + np.array([1.6, 0.55, 0.12], np.float32) * hm      # glows as it heats up
+            if mode == 'integrity':
+                col = self._integrity_rgb(ii)
+            nrm = np.zeros(3)
+            nrm[ax] = sg
+            v9 = np.empty((len(idx), 6, 9), np.float32)
+            v9[:, :, 0:3] = pos
+            v9[:, :, 3:6] = nrm
+            v9[:, :, 6:9] = col[:, None, :]
+            out.append(v9.reshape(-1, 9))
+        res = np.concatenate(out) if out else np.zeros((0, 9), np.float32)
+        if mode is None:
+            self._mesh_cache = res
+        return res
+
+    def load_of(self, ii):
+        """How close each cell is to failing, 0..1: the worst of its stress, its cracks and its heat."""
+        return np.clip(np.maximum(np.maximum(self.stress[ii], self.cdmg[ii] / 0.85), self.heat[ii]), 0.0, 1.0)
+
+    def _integrity_rgb(self, ii):
+        """Green (safe) through yellow to red (about to fail)."""
+        x = self.load_of(ii)
+        return np.stack([np.interp(x, [0.0, 0.5, 1.0], [0.12, 0.95, 0.95]),
+                         np.interp(x, [0.0, 0.5, 1.0], [0.75, 0.85, 0.12]),
+                         np.interp(x, [0.0, 0.5, 1.0], [0.30, 0.12, 0.08])], axis=1).astype(np.float32)
+
+
+class Structure(GridObject):
+    """A fixed structure: cells, bonds between neighbours, and the cells that stand on the ground."""
+
+    def __init__(self, mat, origin, cs, cdmg=None, tint=None):
+        mat = np.asarray(mat)
+        if cdmg is None:
+            cdmg = np.zeros(mat.shape, np.float32)
+        if tint is None:
+            tint = _rng.uniform(0.93, 1.07, mat.shape).astype(np.float32)
+        super().__init__(mat, cdmg, tint, cs)
+        self.frame_pos[:] = origin
+        self.bond = [self.alive[:-1] & self.alive[1:],
+                     self.alive[:, :-1] & self.alive[:, 1:],
+                     self.alive[:, :, :-1] & self.alive[:, :, 1:]]
+        self.anch = np.zeros(self.alive.shape, bool)
+        self.hot = np.asarray(origin, np.float64).copy()
+        self.todo = []                    # (axis, plane) cuts still to be checked in this pass
+        self.pass_broke = False
+        self.stress_dirty = True          # a new structure is checked once before it is trusted
+        self.detach_dirty = False
+        self.wait = 0.0
+        self.max_ratio = 0.0              # highest stress / strength seen in the last pass (1.0 = about to break)
+        self.crack_pts = []               # where bonds just broke, for dust
+        self.crumbs = []                  # (cell centres, materials) of scraps too small to be a body
+        self.stress_new = np.zeros(self.mat.shape, np.float32)   # stress being gathered by the pass that is running
+        self._pass_open = False
+
+    # ---- ground ---------------------------------------------------------------------------------------
+    def refresh_anchors(self, world):
+        """A cell with nothing under it is anchored when the terrain is solid just below its bottom face.
+        Samples in chunks that are not loaded keep their old answer, so unloading never drops a structure."""
+        below = np.zeros_like(self.alive)
+        below[:, 1:, :] = self.alive[:, :-1, :]
+        cand = self.alive & ~below
+        idx = np.argwhere(cand)
+        new = np.zeros_like(self.anch)
+        if len(idx):
+            P = self.frame_pos + (idx + np.array([0.5, 0.0, 0.5])) * self.cs - np.array([0.0, 0.03, 0.0])
+            known = np.array([(int(math.floor(x / CHUNK_SIZE)), int(math.floor(z / CHUNK_SIZE))) in world.dens
+                              for x, z in zip(P[:, 0].tolist(), P[:, 2].tolist())])
+            solid = _density_many(world, P) > 0.0
+            old = self.anch[idx[:, 0], idx[:, 1], idx[:, 2]]
+            val = np.where(known, solid, old)
+            new[idx[:, 0], idx[:, 1], idx[:, 2]] = val
+        if not np.array_equal(new, self.anch):
+            self.anch = new
+            self.detach_dirty = True
+            self.stress_dirty = True
+
+    # ---- damage ---------------------------------------------------------------------------------------
+    def _remove(self, kill):
+        """Take the cells in `kill` out of the structure."""
+        if not kill.any():
+            return
+        self.mat[kill] = 0
+        self.cdmg[kill] = 0
+        self.stress[kill] = 0
+        self.stress_new[kill] = 0
+        a = self.mat > 0
+        for ax in range(3):
+            lo = [slice(None)] * 3
+            hi = [slice(None)] * 3
+            lo[ax], hi[ax] = slice(0, -1), slice(1, None)
+            self.bond[ax] &= a[tuple(lo)] & a[tuple(hi)]
+        self.anch &= a
+        self._geometry()
+        self.detach_dirty = True
+        self.stress_dirty = True
+
+    def blast(self, centre, radius, power):
+        """Blast at a world point. Cells close enough are destroyed; cells further out are cracked, which
+        weakens their bonds. Returns (centres, materials) of the destroyed cells."""
+        idx = np.argwhere(self.alive)
+        if not len(idx):
+            return np.zeros((0, 3)), np.zeros(0, np.int64)
+        cc = self.frame_pos + (idx + 0.5) * self.cs
+        dist = np.linalg.norm(cc - centre, axis=1)
+        near = dist < radius
+        if not near.any():
+            return np.zeros((0, 3)), np.zeros(0, np.int64)
+        idx, cc, dist = idx[near], cc[near], dist[near]
+        f = power * (1.0 - dist / radius) ** 2
+        ii = (idx[:, 0], idx[:, 1], idx[:, 2])
+        m = self.mat[ii]
+        thr = _S_HARD[m] * STRUCT_SHATTER
+        kill = f >= thr
+        hurt = ~kill
+        if hurt.any():
+            jj = (idx[hurt, 0], idx[hurt, 1], idx[hurt, 2])
+            self.cdmg[jj] = np.minimum(0.85, self.cdmg[jj] + 0.7 * f[hurt] / thr[hurt])
+        killed_c, killed_m = cc[kill], m[kill]
+        self.hot = np.asarray(centre, np.float64).copy()
+        if kill.any():
+            mask = np.zeros(self.alive.shape, bool)
+            mask[idx[kill, 0], idx[kill, 1], idx[kill, 2]] = True
+            self._remove(mask)
+        else:
+            self._geometry()
+        self.stress_dirty = True
+        return killed_c, killed_m
+
+    # ---- does it still stand? -------------------------------------------------------------------------
+    def _queue_planes(self):
+        """Every cut plane between two layers of cells, nearest the last blast first."""
+        planes = []
+        for a in range(3):
+            for p in range(self.alive.shape[a] - 1):
+                if self.bond[a][tuple(p if k == a else slice(None) for k in range(3))].any():
+                    mid = self.frame_pos[a] + (p + 1) * self.cs + (self.corner[a])
+                    planes.append((abs(mid - self.hot[a]), a, p))
+        planes.sort()
+        self.todo = [(a, p) for _, a, p in planes]
+        self.pass_broke = False
+        self.stress_new = np.zeros(self.mat.shape, np.float32)
+        self._pass_open = True
+
+    def check_plane(self, a, p):
+        """Cut the structure along one plane and look at what the cut separates from the ground. The part
+        with no ground of its own hangs on the bonds that cross the plane. Its weight acts at its centre of
+        mass; the bonds share it like a bolted joint: a uniform push or pull plus a linear change across the
+        plane that balances the turning moment. A bond pulled apart beyond its tensile strength or crushed
+        beyond its compressive strength breaks (the worst one first), and a moment the bonds cannot balance
+        at all, because they all lie on one line, breaks the section. Returns True if a bond broke."""
+        sl = tuple(p if k == a else slice(None) for k in range(3))
+        cross = self.bond[a][sl]
+        if not cross.any():
+            return False
+        bonds = [b.copy() for b in self.bond]
+        bonds[a][sl] = False
+        lab = _label_cells(self.alive, bonds)
+        anchored = np.unique(lab[self.anch & self.alive])
+        ij = np.argwhere(cross)
+        lo = np.insert(ij, a, p, axis=1)
+        hi = np.insert(ij, a, p + 1, axis=1)
+        l_lo = lab[lo[:, 0], lo[:, 1], lo[:, 2]]
+        l_hi = lab[hi[:, 0], hi[:, 1], hi[:, 2]]
+        a_lo, a_hi = np.isin(l_lo, anchored), np.isin(l_hi, anchored)
+        broke = False
+        for L in np.unique(np.concatenate([l_lo[~a_lo], l_hi[~a_hi]])):
+            # the loaded group L must hang only on anchored ground
+            if np.any(((l_lo == L) & ~a_hi & (l_hi != L)) | ((l_hi == L) & ~a_lo & (l_lo != L))):
+                continue
+            use = ((l_lo == L) & a_hi) | ((l_hi == L) & a_lo)
+            if not use.any():
+                continue
+            sgn = -1.0 if np.any((l_lo == L) & use) else 1.0        # support-to-load direction along axis a
+            n = np.zeros(3)
+            n[a] = sgn
+            lo_u, hi_u = lo[use], hi[use]
+            cm = self.cell_mass
+            mass, com = _group_mass_com(cm, lab == L, self.cs)
+            if mass <= 0:
+                continue
+            fg = np.array([0.0, -mass * STRUCT_GRAVITY, 0.0])
+            pos = (lo_u + hi_u + 1) * 0.5 * self.cs                 # centres of the bonds' shared faces
+            A = np.full(len(pos), self.cs * self.cs)
+            Asum = A.sum()
+            c = (A[:, None] * pos).sum(0) / Asum
+            rho = pos - c
+            sig0 = -float(fg @ n) / Asum
+            mg = np.cross(com - c, fg)
+            mg = mg - (mg @ n) * n                                   # turning about the plane's normal is carried by shear
+            u, v = [k for k in range(3) if k != a]
+            cols = []
+            for k in (u, v):
+                cols.append(((A * rho[:, k])[:, None] * np.cross(rho, n)).sum(0))
+            Mm = np.stack(cols, axis=1)                              # (3, 2)
+            g, *_ = np.linalg.lstsq(Mm, -mg, rcond=None)
+            resid = float(np.linalg.norm(Mm @ g + mg))
+            s = sig0 + g[0] * rho[:, u] + g[1] * rho[:, v]           # stress on each bond, push positive
+            ml = self.mat[lo_u[:, 0], lo_u[:, 1], lo_u[:, 2]]
+            mh = self.mat[hi_u[:, 0], hi_u[:, 1], hi_u[:, 2]]
+            fac = 1.0 - np.maximum(self.cdmg[lo_u[:, 0], lo_u[:, 1], lo_u[:, 2]],
+                                   self.cdmg[hi_u[:, 0], hi_u[:, 1], hi_u[:, 2]])
+            fac = np.maximum(fac, 0.02)
+            comp = np.minimum(_S_COMP[ml], _S_COMP[mh]) * fac
+            tens = np.minimum(_S_TENS[ml], _S_TENS[mh]) * fac
+            shear = np.minimum(_S_SHEAR[ml], _S_SHEAR[mh]) * fac
+            vt = fg - (fg @ n) * n
+            tau = float(np.linalg.norm(vt)) / Asum
+            ratio = np.maximum(np.maximum(s / comp, -s / tens), tau / shear)
+            if resid > 0.02 * (float(np.linalg.norm(mg)) + 1e-9) and resid > 1.0:
+                ratio = np.maximum(ratio, 2.0)                       # one line of bonds cannot hold a turning load
+            r_c = np.minimum(ratio, 1.5).astype(np.float32)
+            np.maximum.at(self.stress_new, (lo_u[:, 0], lo_u[:, 1], lo_u[:, 2]), r_c)
+            np.maximum.at(self.stress_new, (hi_u[:, 0], hi_u[:, 1], hi_u[:, 2]), r_c)
+            self.max_ratio = max(self.max_ratio, float(ratio.max()))
+            for w in np.nonzero(ratio > 1.0)[0]:
+                a_i, b_i = tuple(lo_u[w]), tuple(hi_u[w])
+                self.bond[a][a_i] = False                 # the bond is indexed by the lower of its two cells
+                self.cdmg[a_i] = min(0.9, float(self.cdmg[a_i]) + 0.12)
+                self.cdmg[b_i] = min(0.9, float(self.cdmg[b_i]) + 0.12)
+                if len(self.crack_pts) < 12:
+                    self.crack_pts.append((pos[w] + self.frame_pos, int(ml[w])))
+                broke = True
+        return broke
+
+    def update(self, world, dt, budget=STRUCT_BUDGET_S):
+        """Run the support checks within a time budget. Returns the rigid bodies that came loose."""
+        new = []
+        if self.detach_dirty:
+            new += self._detach()
+        self.wait = max(0.0, self.wait - dt)
+        if not self.todo and self.stress_dirty and self.wait <= 0.0:
+            self._queue_planes()
+            self.stress_dirty = False
+        if self.todo:
+            t0 = time.perf_counter()
+            while self.todo and time.perf_counter() - t0 < budget:
+                a, p = self.todo.pop(0)
+                if self.check_plane(a, p):
+                    self.pass_broke = True
+                    self.detach_dirty = True
+                    self._mesh_cache = None
+                    self.mesh_ver += 1
+            if not self.todo and self._pass_open:
+                self._pass_open = False
+                self.stress = self.stress_new
+                self.stress_ver += 1                  # the integrity overlay redraws from this
+            if not self.todo and self.pass_broke:
+                self.stress_dirty = True              # something broke, so look at everything again
+                self.wait = STRUCT_CRACK_STEP
+                self.pass_broke = False
+            if self.detach_dirty:
+                new += self._detach()
+        return new
+
+    def _detach(self):
+        """Cells with no chain of bonds to an anchored cell leave as rigid bodies."""
+        self.detach_dirty = False
+        lab = _label_cells(self.alive, self.bond)
+        ground = np.unique(lab[self.anch & self.alive])
+        free = self.alive & ~np.isin(lab, ground)
+        if not free.any():
+            return []
+        bodies = []
+        for L in np.unique(lab[free]):
+            mask = lab == L
+            min_cells = max(6, int(round(STRUCT_MIN_BODY_CELLS * (0.5 / self.cs) ** 3)))   # same physical size at any detail
+            if int(mask.sum()) < min_cells:
+                idx = np.argwhere(mask)
+                self.crumbs.append((self.frame_pos + (idx + 0.5) * self.cs, self.mat[mask].copy()))
+            else:
+                bodies.append(RigidBody.from_cells(self, mask))
+        self._remove(free)
+        return bodies
+
+
+class RigidBody(GridObject):
+    """A solid chunk with a centre of mass, an orientation, velocity and spin."""
+
+    def __init__(self, mat, cdmg, tint, cs, com_local):
+        super().__init__(mat, cdmg, tint, cs)
+        self.corner = -np.asarray(com_local, np.float64)
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        self.v = np.zeros(3)
+        self.w = np.zeros(3)
+        self.asleep = False
+        self.still = 0.0
+        self._top = float(WORLD_H)
+        self.last_contacts = 0
+        self.supported = False
+        self._mass_props()
+        self._sync()
+
+    @classmethod
+    def from_cells(cls, st, mask):
+        idx = np.argwhere(mask)
+        lo, hi = idx.min(0), idx.max(0) + 1
+        sl = tuple(slice(int(l), int(h)) for l, h in zip(lo, hi))
+        m = np.where(mask[sl], st.mat[sl], 0)
+        cm = np.where(mask[sl], st.cell_mass[sl], 0.0)
+        cells = np.argwhere(m > 0)
+        com = ((cells + 0.5) * cm[m > 0][:, None]).sum(0) / cm.sum() * st.cs
+        b = cls(m, st.cdmg[sl].copy(), st.tint[sl].copy(), st.cs, com)
+        b.frame_pos = st.frame_pos + lo * st.cs + com
+        return b
+
+    def _mass_props(self):
+        cells = np.argwhere(self.alive)
+        m = self.cell_mass[self.alive]
+        self.mass = float(m.sum())
+        self.invm = 1.0 / max(self.mass, 1e-9)
+        r = (cells + 0.5) * self.cs + self.corner
+        r2 = np.einsum('ij,ij->i', r, r)
+        I = np.eye(3) * float((m * r2).sum()) - np.einsum('i,ij,ik->jk', m, r, r)
+        I += np.eye(3) * float((m * self.cs ** 2 / 6.0).sum())
+        self.Ib_inv = np.linalg.inv(I)
+
+    def _sync(self):
+        self.R = _q_mat(self.q)
+        self.Iinv = self.R @ self.Ib_inv @ self.R.T
+
+    def velocity_at(self, P):
+        return self.v + _cross(self.w, P - self.frame_pos)
+
+    def wake(self):
+        self.asleep = False
+        self.still = 0.0
+
+    # ---- blast --------------------------------------------------------------------------------------
+    def blast(self, centre, radius, power):
+        """Push on the surface that faces the blast. Each surface point takes a pressure that falls off with
+        distance, so the impulse acts away from the centre of mass and the body spins as well as moves."""
+        P = self.surface_world()
+        N = self.surface_normals_world()
+        d = P - centre
+        dist = np.linalg.norm(d, axis=1)
+        ok = (dist < radius) & (dist > 1e-6) & (np.linalg.norm(N, axis=1) > 0.5)
+        if not ok.any():
+            return
+        P, N, d, dist = P[ok], N[ok], d[ok], dist[ok]
+        facing = -np.einsum('ij,ij->i', N, d / dist[:, None])
+        ok = facing > 0.05
+        if not ok.any():
+            return
+        P, N, dist, facing = P[ok], N[ok], dist[ok], facing[ok]
+        pressure = power * (1.0 - dist / radius) ** 2 * facing * (0.5 * self.cs * self.cs)
+        J = -N * (pressure * STRUCT_BLAST_IMPULSE)[:, None]
+        self.v = self.v + J.sum(0) * self.invm
+        self.w = self.w + self.Iinv @ np.cross(P - self.frame_pos, J).sum(0)
+        self.wake()
+
+    # ---- contacts -----------------------------------------------------------------------------------
+    def _contacts(self, world, obstacles):
+        """Points where this body touches or is about to touch something. Returns arrays of the contact
+        point, the normal that pushes the body out, the depth (negative: a small gap), and the velocity
+        of whatever it touches."""
+        Pw = self.surface_world()
+        pts, nrm, dep, vob = [], [], [], []
+        # terrain: the density field, with its gradient giving the surface normal
+        Pc = Pw[self.surf_corner]
+        if len(Pc):
+            Pc = Pc[Pc[:, 1] < self._top + 0.4]            # only points low enough to reach the ground
+        if len(Pc):
+            d = _density_many(world, Pc)
+            near = d > -0.3
+            if near.any():
+                Q = Pc[near]
+                dq = d[near]
+                e = 0.2
+                g = np.stack([(_density_many(world, Q + np.array([e, 0, 0])) - _density_many(world, Q - np.array([e, 0, 0]))),
+                              (_density_many(world, Q + np.array([0, e, 0])) - _density_many(world, Q - np.array([0, e, 0]))),
+                              (_density_many(world, Q + np.array([0, 0, e])) - _density_many(world, Q - np.array([0, 0, e])))],
+                             axis=1) / (2 * e)
+                gn = np.linalg.norm(g, axis=1)
+                ok = gn > 1e-3
+                depth = np.where(ok, dq / np.maximum(gn, 1e-9), -1.0)
+                ok &= depth > -0.06
+                if ok.any():
+                    pts.append(Q[ok])
+                    nrm.append(-g[ok] / gn[ok][:, None])
+                    dep.append(depth[ok])
+                    vob.append(np.zeros((int(ok.sum()), 3)))
+        lo, hi = Pw.min(0) - 0.05, Pw.max(0) + 0.05
+        for O in obstacles:
+            olo, ohi = O.aabb()
+            if (olo > hi).any() or (ohi < lo).any():
+                continue
+            # our points inside the other object
+            m = ((Pw >= olo - 0.05) & (Pw <= ohi + 0.05)).all(axis=1)
+            if m.any():
+                ids = np.nonzero(m)[0]
+                sel, depth, normal = O.probe(Pw[ids])
+                if len(sel):
+                    P = Pw[ids[sel]]
+                    pts.append(P)
+                    nrm.append(normal)
+                    dep.append(depth)
+                    vob.append(O.velocity_at(P))
+            # its points inside us
+            Ow = O.surface_world()
+            m = ((Ow >= lo) & (Ow <= hi)).all(axis=1)
+            if m.any():
+                ids = np.nonzero(m)[0]
+                sel, depth, normal = self.probe(Ow[ids])
+                if len(sel):
+                    P = Ow[ids[sel]]
+                    pts.append(P)
+                    nrm.append(-normal)
+                    dep.append(depth)
+                    vob.append(O.velocity_at(P))
+        if not pts:
+            return None
+        return (np.concatenate(pts), np.concatenate(nrm), np.concatenate(dep), np.concatenate(vob))
+
+    def _ground_top(self, world):
+        """Highest solid terrain sample under the body's footprint, so points above it skip the terrain test."""
+        lo, hi = self.aabb()
+        x0, x1 = int(math.floor(lo[0])) - 1, int(math.ceil(hi[0])) + 1
+        z0, z1 = int(math.floor(lo[2])) - 1, int(math.ceil(hi[2])) + 1
+        n = (x1 - x0 + 1) * (z1 - z0 + 1)
+        if n > 900:
+            return float(WORLD_H)
+        X, Z = np.meshgrid(np.arange(x0, x1 + 1), np.arange(z0, z1 + 1), indexing='ij')
+        XX = np.repeat(X.ravel(), WORLD_H)
+        ZZ = np.repeat(Z.ravel(), WORLD_H)
+        YY = np.tile(np.arange(WORLD_H), n)
+        d = _sample_many(world, XX, YY, ZZ)
+        hit = YY[d > 0]
+        return float(hit.max()) + 1.0 if len(hit) else 0.0
+
+    def _reduce(self, pts, nrm, dep, vob):
+        """Keep the deepest contacts, spread out, so the solver has a few well-placed points instead of dozens."""
+        n = len(pts)
+        if n <= STRUCT_MAX_CONTACTS:
+            return pts, nrm, dep, vob
+        band = dep >= dep.max() - 0.12
+        ids = np.nonzero(band)[0]
+        if len(ids) <= STRUCT_MAX_CONTACTS:
+            rest = np.setdiff1d(np.arange(n), ids)
+            extra = rest[np.argsort(-dep[rest])][:STRUCT_MAX_CONTACTS - len(ids)]
+            ids = np.concatenate([ids, extra])
+        else:
+            chosen = [int(ids[np.argmax(dep[ids])])]
+            mind = np.linalg.norm(pts[ids] - pts[chosen[0]], axis=1)
+            while len(chosen) < STRUCT_MAX_CONTACTS:
+                k = int(np.argmax(mind))
+                chosen.append(int(ids[k]))
+                mind = np.minimum(mind, np.linalg.norm(pts[ids] - pts[ids[k]], axis=1))
+            ids = np.array(chosen)
+        return pts[ids], nrm[ids], dep[ids], vob[ids]
+
+    def _solve(self, pts, nrm, dep, vob, h):
+        """Sequential impulses on the contacts: a push along each normal that never pulls, and friction along
+        two tangents limited by the push. Gives the body its new velocity and spin."""
+        m = len(pts)
+        r = pts - self.frame_pos
+        ref = np.where(np.abs(nrm[:, :1]) < 0.9, np.array([[1.0, 0, 0]]), np.array([[0, 1.0, 0]]))
+        t1 = _cross(nrm, ref)
+        t1 /= np.linalg.norm(t1, axis=1, keepdims=True)
+        t2 = _cross(nrm, t1)
+        D = np.concatenate([nrm, t1, t2])                          # (3m, 3) directions
+        Ang = _cross(np.concatenate([r, r, r]), D)
+        K = self.invm * (D @ D.T) + Ang @ self.Iinv @ Ang.T
+        diag = np.diag(K).copy()
+        diag = np.maximum(diag, 1e-9)
+        jv = D @ self.v + Ang @ self.w - np.einsum('ij,ij->i', D, np.concatenate([vob, vob, vob]))
+        vn0 = jv[:m].copy()
+        c = (dep - STRUCT_SLOP) / h
+        c = np.where(c > 0, np.minimum(c * STRUCT_PUSHOUT, STRUCT_MAX_PUSH), c)      # push out of a penetration; a gap allows approach
+        bounce = vn0 < -1.5
+        c = np.where(bounce, np.maximum(c, -STRUCT_RESTITUTION * vn0), c)
+        lam = [0.0] * (3 * m)
+        cl = c.tolist()
+        dg = diag.tolist()
+        for _ in range(STRUCT_SOLVER_ITERS):
+            moved = 0.0
+            for i in range(m):
+                new = max(0.0, lam[i] - (jv[i] - cl[i]) / dg[i])
+                dl = new - lam[i]
+                if dl:
+                    lam[i] = new
+                    jv += K[:, i] * dl
+                    moved += abs(dl)
+                lim = STRUCT_FRICTION * lam[i]
+                for row in (m + i, 2 * m + i):
+                    new = min(max(lam[row] - jv[row] / dg[row], -lim), lim)
+                    dl = new - lam[row]
+                    if dl:
+                        lam[row] = new
+                        jv += K[:, row] * dl
+                        moved += abs(dl)
+            if moved < 1e-5:
+                break
+        lam = np.array(lam)
+        self.v = self.v + self.invm * (D.T @ lam)
+        self.w = self.w + self.Iinv @ (Ang.T @ lam)
+
+    def step(self, world, dt, obstacles):
+        if self.asleep:
+            return
+        h = dt / STRUCT_SUBSTEPS
+        self._top = self._ground_top(world) + 0.5 * float(np.linalg.norm(self.v)) * dt
+        contact_steps = 0
+        support = False
+        for _ in range(STRUCT_SUBSTEPS):
+            self.v[1] -= STRUCT_GRAVITY * h
+            self.w *= math.exp(-0.25 * h)
+            con = self._contacts(world, obstacles)
+            if con is not None:
+                pts, nrm, dep, vob = self._reduce(*con)
+                self._solve(pts, nrm, dep, vob, h)
+                contact_steps += 1
+                self.last_contacts = len(pts)
+                cp = pts - pts.mean(0)
+                support = len(pts) >= 3 and np.linalg.svd(cp, compute_uv=False)[1] > 0.12
+            self.frame_pos = self.frame_pos + self.v * h
+            wq = np.array([0.0, *(self.w * h * 0.5)])
+            self.q = self.q + _q_mul(wq, self.q)
+            self.q /= np.linalg.norm(self.q)
+            self._sync()
+        self.supported = support
+        self._aabb = None
+        slow = np.linalg.norm(self.v) < STRUCT_SLEEP_LIN and np.linalg.norm(self.w) < STRUCT_SLEEP_ANG
+        if slow and support:
+            self.still += dt
+            if self.still >= STRUCT_SLEEP_TIME:
+                self.asleep = True
+                self.v[:] = 0.0
+                self.w[:] = 0.0
+        else:
+            self.still = 0.0
+
+
+class StructureManager:
+    """Every structure and loose body in the world."""
+
+    def __init__(self):
+        self.structs = []
+        self.bodies = []
+
+    def clear(self):
+        self.structs = []
+        self.bodies = []
+        self.extra_dirt = 0
+
+    # ---- building -----------------------------------------------------------------------------------
+    def ground_y(self, world, x, z):
+        ys = np.arange(WORLD_H - 1.0, 0.0, -0.25)
+        P = np.stack([np.full(len(ys), x), ys, np.full(len(ys), z)], axis=1)
+        d = _density_many(world, P)
+        hit = np.nonzero(d > 0)[0]
+        if not len(hit):
+            return None
+        k = int(hit[0])
+        if k == 0:
+            return float(ys[0])
+        d0, d1 = d[k - 1], d[k]
+        return float(ys[k - 1] + (ys[k] - ys[k - 1]) * (0.0 - d0) / (d1 - d0))
+
+    def add(self, world, mat, x0, z0, cs=0.5):
+        """Put a grid of materials (0 = empty) on the ground with its lowest corner at (x0, z0)."""
+        nx, ny, nz = mat.shape
+        y = self.ground_y(world, x0 + nx * cs * 0.5, z0 + nz * cs * 0.5)
+        if y is None:
+            return None
+        st = Structure(np.asarray(mat, np.int16), np.array([x0, y, z0]), cs)
+        st.refresh_anchors(world)
+        self.structs.append(st)
+        return st
+
+    def spawn_pillar(self, world, x, z, cells=(4, 16, 4), cs=0.5, mat=STONE):
+        """A pillar standing on the ground at (x, z)."""
+        y = self.ground_y(world, x, z)
+        if y is None:
+            return None
+        nx, ny, nz = cells
+        origin = np.array([x - nx * cs * 0.5, y, z - nz * cs * 0.5])
+        st = Structure(np.full(cells, mat, np.int16), origin, cs)
+        st.refresh_anchors(world)
+        self.structs.append(st)
+        return st
+
+    # ---- events -------------------------------------------------------------------------------------
+    def wake_all(self):
+        for b in self.bodies:
+            b.wake()
+
+    def on_terrain_changed(self, world):
+        """The ground changed: structures re-check what they stand on and loose bodies wake up."""
+        for s in self.structs:
+            s.refresh_anchors(world)
+        self.wake_all()
+        BODIES.wake_all()
+
+    def blast(self, world, centre, radius, power=1.0):
+        """Damage structures, push bodies, throw chunks. The caller draws the fireball."""
+        centre = np.asarray(centre, np.float64)
+        BODIES.wake_all()
+        broken = []
+        for s in self.structs:
+            lo, hi = s.aabb()
+            if (centre < lo - radius).any() or (centre > hi + radius).any():
+                continue
+            kc, km = s.blast(centre, radius, power)
+            for c, m in zip(kc, km):
+                d = c - centre
+                broken.append((1.0, c[0] - 0.5, c[1] - 0.5, c[2] - 0.5, int(m), d[0], d[1], d[2]))
+            if len(kc):
+                self._throw_chunks(kc, km, centre, radius, world=world, cs=s.cs)
+        for b in self.bodies:
+            b.blast(centre, radius, power)
+            if np.linalg.norm(b.frame_pos - centre) < radius * 3:
+                b.wake()
+        return broken
+
+    def _dust(self, pos, mats, per=1):
+        """Puffs of dust in the colour of the material, where bonds broke or scraps fell away."""
+        P = np.repeat(np.asarray(pos, np.float64).reshape(-1, 3), per, axis=0)
+        n = len(P)
+        col = _S_RGB[np.repeat(np.asarray(mats, np.int64), per)] * 0.55 + 0.30
+        V = _rng.normal(0, 0.6, (n, 3))
+        PARTS.add(FX_DUST, P + _rng.normal(0, 0.08, (n, 3)), V, _rng.uniform(0.6, 1.4, n),
+                  _rng.uniform(0.10, 0.20, n), _rng.uniform(0.3, 0.6, n), col, 0.4, 2.0, 0.0)
+
+    def _throw_chunks(self, pos, mats, centre, radius, slow=False, world=None, cs=0.5):
+        n = len(pos)
+        scale = cs / 0.5                                          # debris is sized to the cells it came from
+        k = min(2, max(1, 40 // max(n, 1)))
+        P = np.repeat(pos, k, axis=0) + _rng.uniform(-0.12, 0.12, (n * k, 3))
+        d = P - centre
+        dist = np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 0.2)
+        speed = _rng.uniform(0.5, 2.0, (n * k, 1)) if slow else _rng.uniform(3.0, 9.0, (n * k, 1))
+        V = d / dist * speed * (1.2 - 0.5 * np.minimum(dist / radius, 1.0))
+        V[:, 1] = np.minimum(V[:, 1], 1.0)                      # no extra lift: pieces drop and pile up instead of floating
+        col = _S_RGB[np.repeat(mats, k)] * _rng.uniform(0.8, 1.1, (n * k, 1)).astype(np.float32)
+        BODIES.spawn_chunks(P, V, _rng.uniform(0.12, 0.26, n * k) * scale, col, world)
+
+    def update(self, world, dt):
+        dt = min(dt, 0.05)
+        for s in list(self.structs):
+            new = s.update(world, dt)
+            if new:
+                self.bodies.extend(new)
+                self.wake_all()
+                BODIES.wake_all()                     # a piece broke away: cubes resting on it must re-check
+            if s.crack_pts:
+                self._dust([p for p, _ in s.crack_pts], [m for _, m in s.crack_pts])
+                s.crack_pts = []
+            for cc, mm in s.crumbs:
+                self._dust(cc, mm, per=2)
+                self._throw_chunks(cc, mm, cc.mean(0) - np.array([0.0, 0.4, 0.0]), 1.5, slow=True, world=world, cs=s.cs)
+            s.crumbs = []
+            if not s.alive.any():
+                self.structs.remove(s)
+        for o in self.objects():
+            o.cool(dt)                                    # heat from the laser drains away
+        awake = [b for b in self.bodies if not b.asleep]
+        for b in awake:
+            others = self.structs + [o for o in self.bodies if o is not b]
+            b.step(world, dt, others)
+        self.bodies = [b for b in self.bodies if b.frame_pos[1] > -30.0 and b.alive.any()]
+
+    # ---- queries --------------------------------------------------------------------------------------
+    def objects(self):
+        return self.structs + self.bodies
+
+    def eject_player(self, world, player):
+        """A body that has come down on the player cannot be walked through: step the player out of it, to the
+        nearest free spot, or on top of it."""
+        r, h = PLAYER_RADIUS, PLAYER_HEIGHT
+        if not (self.structs or self.bodies) or not self.hits_box(player.pos[0], player.pos[1], player.pos[2], r, h):
+            return False
+        for dist in (0.4, 0.8, 1.2, 1.8, 2.6, 3.6):
+            for k in range(12):
+                a = k * math.pi / 6.0
+                x, z = player.pos[0] + dist * math.cos(a), player.pos[2] + dist * math.sin(a)
+                if not _box_hits_solid(world, x, player.pos[1], z):
+                    player.pos[0], player.pos[2] = x, z
+                    player.vel[:] = 0.0
+                    return True
+        for up in (0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0):
+            if not _box_hits_solid(world, player.pos[0], player.pos[1] + up, player.pos[2]):
+                player.pos[1] += up
+                player.vel[:] = 0.0
+                return True
+        return False
+
+    def hits_box(self, x, y, z, r, h):
+        """True if the player's box at feet position (x, y, z) is inside a structure or a body."""
+        if not (self.structs or self.bodies):
+            return False
+        lo_b = np.array([x - r, y, z - r])
+        hi_b = np.array([x + r, y + h, z + r])
+        P = None
+        for o in self.objects():
+            lo, hi = o.aabb()
+            if (lo > hi_b).any() or (hi < lo_b).any():
+                continue
+            if P is None:
+                P = np.array([[x + dx, ys, z + dz] for ys in (y + 0.05, y + 0.5 * h, y + h - 0.05)
+                              for dx in (-r, 0.0, r) for dz in (-r, 0.0, r)])
+            if len(o.probe(P)[0]):
+                return True
+        return False
+
+    def raycast(self, origin, direction, reach, step=0.05):
+        """First point along a ray that is inside a structure or body, or None. Returns (t, last point outside)."""
+        best = None
+        t = np.arange(0.0, reach, step)
+        P = np.asarray(origin, np.float64) + np.outer(t, np.asarray(direction, np.float64))
+        for o in self.objects():
+            sel = o.probe(P)[0]
+            if len(sel):
+                k = int(sel.min())
+                if best is None or k < best[0]:
+                    best = (k, o)
+        if best is None:
+            return None
+        k = best[0]
+        return float(t[k]), P[max(k - 1, 0)]
+
+
+STRUCTS = StructureManager()
+
+
+BLAST_RADIUS = 3.0       # blocks: how far a blast reaches
+BLAST_POWER  = 1.0       # 1.0 shatters concrete cells inside about half the radius and cracks the ring beyond
+
+
+def _structure_chip(self, world, point):
+    """The drill on a structure: a small blast that bites out a few cells."""
+    broken = self.blast(world, point, 1.0, 1.6)
+    fx_explosion(point, 0.5, broken, _S_RGB)
+
+
+StructureManager.chip = _structure_chip
+
+
+# ---- the demo layout: one solid test cube per material, beside the dirt cube ------------------------------
+def _solid_cube(mat):
+    return lambda n: np.full((n, n, n), mat, np.int16)           # always 10 x 10 x 10 blocks; n = 10 * cells per block
+
+
+DEMO_LAYOUT = [(0, _solid_cube(DIRT)), (1, _solid_cube(STONE)), (2, _solid_cube(BRICK)), (3, _solid_cube(PLANKS)), (4, _solid_cube(STEEL))]
+
+
+def _layout_ready(self, world):
+    """True when every chunk under the layout is loaded."""
+    for cx in range(math.floor(-8 / CHUNK_SIZE), math.floor(70 / CHUNK_SIZE) + 1):
+        for cz in range(math.floor(-50 / CHUNK_SIZE), math.floor(0 / CHUNK_SIZE) + 1):
+            if (cx, cz) not in world.dens:
+                return False
+    return True
+
+
+def _build_layout(self, world, res=2):
+    """Stand the demo shapes in a row beside the dirt cube (slot 0), on the same grid as the cubes: a slot is
+    14 blocks across, four to a row, rows going back along -z. `res` is cells per block along each side: the
+    cubes keep their size, and a higher value builds them from smaller pieces."""
+    res = max(1, int(res))
+    cs = 1.0 / res
+    for k, make in DEMO_LAYOUT:
+        m = make(10 * res)
+        x0, _, z0 = cube_slot_lo(min(k, 3))
+        x0 += 14.0 * max(k - 3, 0)                                 # a fifth slot continues the row instead of starting a new one
+        x0 -= 0.5                                                  # the cube's faces sit half a block outside its samples
+        z0 -= 0.5
+        w, d = m.shape[0] * cs, m.shape[2] * cs                    # centre each shape in its 10 x 10 slot
+        self.add(world, m, x0 + (10.0 - w) * 0.5, z0 + (10.0 - d) * 0.5, cs)
+
+
+StructureManager.layout_ready = _layout_ready
+StructureManager.build_layout = _build_layout
+
+
+_SOLID_VERT = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNrm;
+layout(location = 2) in vec3 aCol;
+uniform mat4 uVP;
+uniform mat4 uModel;       // the object's pose: rotation and position
+out vec3 vCol;
+out vec3 vNrm;
+void main() {
+    vec4 w = uModel * vec4(aPos, 1.0);
+    vCol = aCol;
+    vNrm = mat3(uModel) * aNrm;
+    gl_Position = uVP * w;
+}
+"""
+
+_SOLID_FRAG = """
+#version 330 core
+in vec3 vCol;
+in vec3 vNrm;
+out vec4 fragColor;
+uniform float uLight;
+uniform float uAlpha;
+void main() {
+    vec3 n = normalize(vNrm);
+    vec3 sun = normalize(vec3(0.45, 0.80, 0.35));
+    float diff = max(dot(n, sun), 0.0);
+    float sky = 0.5 + 0.5 * n.y;
+    float shade = 0.38 + 0.30 * sky + 0.42 * diff;
+    fragColor = vec4(vCol * shade * uLight, uAlpha);
+}
+"""
+
+
+class StructureRenderer:
+    """Draws every structure and loose body as solid geometry: one mesh per object, placed by a model
+    matrix, so a body that has turned over is drawn turned over. A mesh is uploaded again only when the
+    object's cells change."""
+
+    def __init__(self):
+        vs = _compile_shader(_SOLID_VERT, gl.GL_VERTEX_SHADER)
+        fs = _compile_shader(_SOLID_FRAG, gl.GL_FRAGMENT_SHADER)
+        self.program = _link_program(vs, fs)
+        self.u_vp = gl.glGetUniformLocation(self.program, "uVP")
+        self.u_model = gl.glGetUniformLocation(self.program, "uModel")
+        self.u_light = gl.glGetUniformLocation(self.program, "uLight")
+        self.u_alpha = gl.glGetUniformLocation(self.program, "uAlpha")
+        self.icache = {}     # integrity colouring: id(object) -> [vao, vbo, count, (mesh ver, stress ver), object]
+        self.cache = {}      # id(object) -> [vao, vbo, vertex count, mesh version, object]
+
+    def _make(self):
+        vao = gl.glGenVertexArrays(1)
+        vbo = gl.glGenBuffers(1)
+        gl.glBindVertexArray(vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, vbo)
+        for loc, off in ((0, 0), (1, 12), (2, 24)):
+            gl.glEnableVertexAttribArray(loc)
+            gl.glVertexAttribPointer(loc, 3, gl.GL_FLOAT, gl.GL_FALSE, 36, ctypes.c_void_p(off))
+        gl.glBindVertexArray(0)
+        return vao, vbo
+
+    def render(self, vp, ambient, overlay=False):
+        objs = STRUCTS.objects()
+        live = {id(o) for o in objs}
+        for k in [k for k in self.icache if k not in live]:
+            vao, vbo = self.icache.pop(k)[:2]
+            gl.glDeleteVertexArrays(1, [vao])
+            gl.glDeleteBuffers(1, [vbo])
+        for k in [k for k in self.cache if k not in live]:
+            vao, vbo = self.cache.pop(k)[:2]
+            gl.glDeleteVertexArrays(1, [vao])
+            gl.glDeleteBuffers(1, [vbo])
+        if not objs:
+            return
+        gl.glUseProgram(self.program)
+        gl.glUniformMatrix4fv(self.u_vp, 1, gl.GL_TRUE, vp.astype(np.float32))
+        gl.glUniform1f(self.u_light, max(float(ambient), GFX['ambient_floor']))
+        gl.glUniform1f(self.u_alpha, 1.0)
+        model = np.eye(4, dtype=np.float32)
+        for o in objs:
+            ent = self.cache.get(id(o))
+            if ent is None:
+                vao, vbo = self._make()
+                ent = self.cache[id(o)] = [vao, vbo, 0, -1, o]
+            if ent[3] != o.mesh_ver:
+                data = np.ascontiguousarray(o.mesh(), np.float32)
+                gl.glBindBuffer(gl.GL_ARRAY_BUFFER, ent[1])
+                gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_STATIC_DRAW)
+                ent[2], ent[3] = len(data), o.mesh_ver
+            if not ent[2]:
+                continue
+            model[:3, :3] = o.R
+            model[:3, 3] = o.frame_pos
+            gl.glUniformMatrix4fv(self.u_model, 1, gl.GL_TRUE, model)
+            gl.glBindVertexArray(ent[0])
+            gl.glDrawArrays(gl.GL_TRIANGLES, 0, ent[2])
+        if overlay:
+            # Second pass over the same faces, coloured by how close each cell is to failing.
+            gl.glEnable(gl.GL_BLEND)
+            gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+            gl.glDepthFunc(gl.GL_LEQUAL)
+            gl.glDepthMask(gl.GL_FALSE)
+            gl.glUniform1f(self.u_alpha, 0.72)
+            gl.glUniform1f(self.u_light, 1.0)
+            for o in objs:
+                ent = self.icache.get(id(o))
+                if ent is None:
+                    vao, vbo = self._make()
+                    ent = self.icache[id(o)] = [vao, vbo, 0, None, o]
+                key = (o.mesh_ver, o.stress_ver, o.heated)
+                if ent[3] != key or o.heated:
+                    data = np.ascontiguousarray(o.mesh('integrity'), np.float32)
+                    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, ent[1])
+                    gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_STATIC_DRAW)
+                    ent[2], ent[3] = len(data), key
+                if not ent[2]:
+                    continue
+                model[:3, :3] = o.R
+                model[:3, 3] = o.frame_pos
+                gl.glUniformMatrix4fv(self.u_model, 1, gl.GL_TRUE, model)
+                gl.glBindVertexArray(ent[0])
+                gl.glDrawArrays(gl.GL_TRIANGLES, 0, ent[2])
+            gl.glDepthMask(gl.GL_TRUE)
+            gl.glDepthFunc(gl.GL_LESS)
+            gl.glDisable(gl.GL_BLEND)
+            gl.glUniform1f(self.u_alpha, 1.0)
+        gl.glBindVertexArray(0)
+
+
+
+
+
+# ---- weapons: keys 1-6 pick one, the left mouse button fires it -------------------------------------------
+def explode(world, centre, radius, power, settings, dig=True):
+    """A blast at a point: structures and loose pieces take the damage and the push, the terrain is carved."""
+    broken = STRUCTS.blast(world, centre, radius, power)
+    fx_explosion(centre, radius, broken, _S_RGB)
+    if dig and STRUCT_BLAST_DIGS:
+        dug = world.dig(centre, radius * 0.9, DIG_STRENGTH * 1.6)
+        BODIES.spawn(world, world.take_dug_cells(), int(settings['dirt_cubes']), settings['dirt_cube_size'])
+        if dug > 0.0:
+            STRUCTS.on_terrain_changed(world)
+
+
+def _first_hit(world, origin, d, reach):
+    """Nearest solid thing along a ray, terrain or structure: the last free point before it, or None."""
+    origin = np.asarray(origin, np.float64)
+    th = raycast_terrain(world, origin, d, reach)
+    sh = STRUCTS.raycast(origin, d, reach)
+    t_ter = float(np.linalg.norm(np.array(th, np.float64) - origin)) if th is not None else 1e9
+    if sh is not None and sh[0] < t_ter:
+        return np.asarray(sh[1], np.float64)
+    return None if th is None else np.array(th, np.float64)
+
+
+WEAPONS = [
+    dict(name='Drill',            note='hold: chips and digs',          rate=DIG_INTERVAL),
+    dict(name='Rifle',            note='hitscan, small hole',           rate=0.12),
+    dict(name='Grenade launcher', note='arcing shell, medium blast',    rate=0.8),
+    dict(name='Rocket launcher',  note='fast, big blast',               rate=1.2),
+    dict(name='Melting laser',    note='hold: melts what it touches',   rate=0.0),
+    dict(name='Demo charge',      note='sticks; right click detonates', rate=0.4),
+]
+_CHARGE_MAX = 8
+
+
+class Projectiles:
+    """Grenades, rockets and sticky charges in flight or placed."""
+    GRAV = {'grenade': 18.0, 'rocket': 0.0, 'charge': 24.0}
+
+    def __init__(self):
+        self.items = []
+
+    def clear(self):
+        self.items = []
+
+    def launch(self, kind, pos, vel):
+        if kind == 'charge' and sum(p['kind'] == 'charge' for p in self.items) >= _CHARGE_MAX:
+            for p in self.items:                       # the oldest charge makes room
+                if p['kind'] == 'charge':
+                    self.items.remove(p)
+                    break
+        self.items.append(dict(kind=kind, pos=np.array(pos, np.float64), vel=np.array(vel, np.float64),
+                               age=0.0, stuck=False))
+
+    @property
+    def n_charges(self):
+        return sum(p['kind'] == 'charge' for p in self.items)
+
+    def detonate(self, world, settings):
+        keep = []
+        for p in self.items:
+            if p['kind'] == 'charge':
+                explode(world, p['pos'], 5.0, 3.2, settings)
+            else:
+                keep.append(p)
+        self.items = keep
+
+    def update(self, world, dt, settings):
+        keep = []
+        for p in self.items:
+            if p['stuck']:
+                p['age'] += dt
+                keep.append(p)
+                continue
+            p['age'] += dt
+            p['vel'][1] -= self.GRAV[p['kind']] * dt
+            step = p['vel'] * dt
+            L = float(np.linalg.norm(step))
+            hit = _first_hit(world, p['pos'], step / L, L + 0.05) if L > 1e-9 else None
+            if hit is not None:
+                if p['kind'] == 'charge':
+                    p['pos'], p['vel'], p['stuck'] = hit, np.zeros(3), True
+                    keep.append(p)
+                elif p['kind'] == 'rocket':
+                    explode(world, hit, 4.2, 2.4, settings)
+                else:
+                    explode(world, hit, 3.2, 1.2, settings)
+                continue
+            p['pos'] = p['pos'] + step
+            if p['kind'] == 'grenade' and p['age'] > 3.5:
+                explode(world, p['pos'], 3.2, 1.2, settings)
+            elif p['age'] > 8.0 or p['pos'][1] < -50.0:
+                pass                                     # flew off: gone
+            else:
+                keep.append(p)
+        self.items = keep
+
+
+PROJ = Projectiles()
+_last_shot = {}
+
+
+def fire_weapon(world, player, settings, idx):
+    """Called every frame the left button is held: fires weapon idx when its own rate allows."""
+    w = WEAPONS[idx]
+    now = time.perf_counter()
+    if now - _last_shot.get(idx, 0.0) < w['rate']:
+        return
+    prev = _last_shot.get(idx)
+    _last_shot[idx] = now
+    held_dt = 1.0 / 60.0 if prev is None or now - prev > 0.12 else min(now - prev, 0.05)   # seconds the button has been held this frame
+    eye = np.asarray(player.eye, np.float64)
+    fwd = np.asarray(player.forward(), np.float64)
+    if idx == 0:                                         # drill: the original dig, and a chip on structures
+        hit = raycast_terrain(world, eye, fwd, REACH)
+        sh = STRUCTS.raycast(eye, fwd, REACH)
+        t_hit = float(np.linalg.norm(np.array(hit, np.float64) - eye)) if hit is not None else 1e9
+        if sh is not None and sh[0] < t_hit:
+            STRUCTS.chip(world, sh[1])
+        elif hit is not None:
+            dug = world.dig(hit, DIG_RADIUS, DIG_STRENGTH)
+            BODIES.spawn(world, world.take_dug_cells(), int(settings['dirt_cubes']), settings['dirt_cube_size'])
+            if dug > 0.0:
+                STRUCTS.on_terrain_changed(world)
+    elif idx == 1:                                       # rifle
+        p = _first_hit(world, eye, fwd, 120.0)
+        if p is not None:
+            explode(world, p, 1.0, 1.5, settings, dig=False)
+    elif idx == 2:                                       # grenade launcher
+        PROJ.launch('grenade', eye + fwd * 0.8, fwd * 30.0 + np.array([0.0, 4.0, 0.0]))
+    elif idx == 3:                                       # rocket launcher
+        PROJ.launch('rocket', eye + fwd * 0.8, fwd * 55.0)
+    elif idx == 4:                                       # melting laser
+        laser_fire(world, eye, fwd, held_dt)
+    elif idx == 5:                                       # demolition charge
+        PROJ.launch('charge', eye + fwd * 0.8, fwd * 16.0 + np.array([0.0, 2.0, 0.0]))
+
+
+_PROJ_VERT = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aCol;
+uniform mat4 uVP;
+out vec4 vCol;
+void main() {
+    vCol = aCol;
+    gl_Position = uVP * vec4(aPos, 1.0);
+    gl_PointSize = clamp(260.0 / max(gl_Position.w, 0.5), 5.0, 28.0);
+}
+"""
+_PROJ_FRAG = """
+#version 330 core
+in vec4 vCol;
+out vec4 fragColor;
+void main() {
+    vec2 c = gl_PointCoord - 0.5;
+    if (dot(c, c) > 0.25) discard;
+    fragColor = vCol;
+}
+"""
+
+
+# ---- melting laser ------------------------------------------------------------------------------------------
+LASER_REACH        = 45.0    # blocks
+LASER_MELT_RADIUS  = 1.5     # blocks: width of the tunnel it bores into the ground
+LASER_MELT_RATE    = 16.0    # density removed per second at the centre of the spot
+LASER_CELL_RADIUS  = 0.9     # blocks: how far from the spot a structure cell is heated
+LASER_MELT_TIME    = 0.35    # seconds of full beam to melt a cell of hardness 1 (stone); steel takes 3x longer
+LASER_COOL         = 1.2     # heat lost per second once the beam moves away
+_MOLTEN_RGB = np.array([1.0, 0.42, 0.08], np.float32)
+LASER = dict(t=-10.0, start=np.zeros(3), end=np.zeros(3), hit=False, ter_t=0.0)
+
+
+def _grid_melt(self, point, radius, dt):
+    """Heat the cells around a world point. A cell melts when its heat reaches 1, which takes longer for harder
+    materials. Heated cells also crack, which weakens the bonds that hold a structure up.
+    Returns (centres, materials) of the cells that melted this call."""
+    none = (np.zeros((0, 3)), np.zeros(0, np.int64))
+    q = ((np.asarray(point, np.float64) - self.frame_pos) @ self.R - self.corner) / self.cs      # the point in grid units
+    r = radius / self.cs
+    lo = np.maximum(np.floor(q - r).astype(np.int64), 0)
+    hi = np.minimum(np.ceil(q + r).astype(np.int64), np.array(self.alive.shape))
+    if (hi <= lo).any():
+        return none
+    sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+    idx = np.argwhere(self.alive[sl]) + lo
+    if not len(idx):
+        return none
+    dist = np.linalg.norm(idx + 0.5 - q, axis=1) * self.cs
+    near = dist < radius
+    if not near.any():
+        return none
+    idx, dist = idx[near], dist[near]
+    ii = (idx[:, 0], idx[:, 1], idx[:, 2])
+    falloff = 1.0 - dist / radius
+    self.heat[ii] += dt * falloff / (_S_HARD[self.mat[ii]] * LASER_MELT_TIME)
+    self.cdmg[ii] = np.maximum(self.cdmg[ii], np.minimum(0.85, 0.85 * self.heat[ii]))
+    self.heated = True
+    self._mesh_cache = None
+    self.mesh_ver += 1
+    gone = self.heat[ii] >= 1.0
+    if not gone.any():
+        if hasattr(self, 'stress_dirty'):
+            self.stress_dirty = True                  # cracked cells carry less: look at the supports again
+        return none
+    g = idx[gone]
+    mask = np.zeros(self.alive.shape, bool)
+    mask[g[:, 0], g[:, 1], g[:, 2]] = True
+    centres = self.frame_pos + ((g + 0.5) * self.cs + self.corner) @ self.R.T
+    mats = self.mat[mask].copy()
+    self._remove(mask)
+    self.heat[mask] = 0.0
+    return centres, mats
+
+
+def _grid_cool(self, dt):
+    """Heat drains away once the beam has moved off a cell."""
+    if not self.heated:
+        return
+    self.heat *= math.exp(-LASER_COOL * dt)
+    self.heat[self.heat < 0.03] = 0.0
+    self.heated = bool(self.heat.any())
+    self._mesh_cache = None
+    self.mesh_ver += 1
+
+
+def _body_remove(self, kill):
+    """A loose body loses cells: its mass and spin properties are worked out again for what is left."""
+    self.mat[kill] = 0
+    self.cdmg[kill] = 0
+    self.heat[kill] = 0
+    self._geometry()
+    if self.alive.any():
+        self._mass_props()
+        self.wake()
+
+
+GridObject.melt = _grid_melt
+GridObject.cool = _grid_cool
+RigidBody._remove = _body_remove
+
+
+def _raycast_obj(self, origin, direction, reach, step=0.05):
+    """Like raycast, but also says which object was hit. Returns (t, last free point, object) or None."""
+    best = None
+    t = np.arange(0.0, reach, step)
+    P = np.asarray(origin, np.float64) + np.outer(t, np.asarray(direction, np.float64))
+    for o in self.objects():
+        sel = o.probe(P)[0]
+        if len(sel):
+            k = int(sel.min())
+            if best is None or k < best[0]:
+                best = (k, o)
+    if best is None:
+        return None
+    k = best[0]
+    return float(t[k]), P[max(k - 1, 0)], best[1]
+
+
+def _molten_drips(world, centres, mats, per=2, cap=40, cs=0.5):
+    """Small glowing cubes where something melted. They drop and pile up like any other debris."""
+    C = np.asarray(centres, np.float64).reshape(-1, 3)
+    M = np.asarray(mats, np.int64).reshape(-1)
+    if not len(C):
+        return
+    if len(C) * per > cap:
+        pick = _rng.choice(len(C), max(1, cap // per), replace=False)
+        C, M = C[pick], M[pick]
+    P = np.repeat(C, per, axis=0) + _rng.uniform(-0.2, 0.2, (len(C) * per, 3))
+    n = len(P)
+    V = _rng.normal(0.0, 0.5, (n, 3))
+    V[:, 1] = _rng.uniform(-0.5, 0.3, n)
+    base = 0.3 * _S_RGB[np.repeat(M, per)] + 0.7 * _MOLTEN_RGB
+    BODIES.spawn_chunks(P, V, _rng.uniform(0.08, 0.17, n) * (cs / 0.5), base *_rng.uniform(0.85, 1.1, (n, 1)).astype(np.float32), world)
+
+
+def _manager_melt(self, world, point, radius, dt):
+    """Heat every structure and loose body near the point; whatever melts drips."""
+    point = np.asarray(point, np.float64)
+    out = False
+    for o in self.objects():
+        lo, hi = o.aabb()
+        if (point < lo - radius).any() or (point > hi + radius).any():
+            continue
+        c, m = o.melt(point, radius, dt)
+        if len(c):
+            _molten_drips(world, c, m, cs=o.cs)
+            out = True
+    if out:
+        BODIES.wake_all()                      # cubes asleep on the melted cells must fall
+    return out
+
+
+StructureManager.raycast_obj = _raycast_obj
+StructureManager.melt = _manager_melt
+
+
+def _terrain_hit_t(world, eye, fwd, reach, step=0.15):
+    """Distance along the ray to the ground surface, from the smooth density field, or None."""
+    ts = np.arange(0.0, reach, step)
+    P = eye[None, :] + ts[:, None] * fwd[None, :]
+    d = _density_many(world, P)
+    hit = np.nonzero(d > 0.0)[0]
+    if not len(hit):
+        return None
+    k = int(hit[0])
+    if k == 0:
+        return 0.0
+    d0, d1 = d[k - 1], d[k]
+    return float(ts[k - 1] + step * (0.0 - d0) / max(d1 - d0, 1e-9))
+
+
+def laser_fire(world, eye, fwd, dt):
+    """One frame of the beam: find what it touches, heat it, and remember where it ended so it can be drawn."""
+    eye = np.asarray(eye, np.float64)
+    fwd = np.asarray(fwd, np.float64)
+    t_ter = _terrain_hit_t(world, eye, fwd, LASER_REACH)
+    so = STRUCTS.raycast_obj(eye, fwd, LASER_REACH)
+    use_struct = so is not None and (t_ter is None or so[0] <= t_ter)
+    if so is None and t_ter is None:
+        end, hit = eye + fwd * LASER_REACH, False
+    elif use_struct:
+        end, hit = np.asarray(so[1], np.float64), True
+        STRUCTS.melt(world, end + fwd * 0.1, LASER_CELL_RADIUS, dt)
+    else:
+        end, hit = eye + fwd * t_ter, True
+        spot = end + fwd * 0.7
+        # The ground gets denser the deeper it goes, so a fixed rate would slow to a crawl as the hole deepens.
+        # Scale the rate by how dense the spot is, which keeps the bore at a steady speed.
+        deep = max(0.0, float(_density_many(world, spot[None, :])[0]))
+        dug = world.dig(spot, LASER_MELT_RADIUS, LASER_MELT_RATE * dt * (1.0 + 1.5 * deep))
+        cells = world.take_dug_cells()
+        if cells:
+            _molten_drips(world, np.concatenate(cells), np.full(sum(len(c) for c in cells), DIRT), per=1)
+        LASER['ter_t'] += dt
+        if dug > 0.0 and LASER['ter_t'] > 0.12:           # tell structures and loose pieces the ground changed
+            LASER['ter_t'] = 0.0
+            STRUCTS.on_terrain_changed(world)
+    LASER.update(t=time.perf_counter(), start=eye.copy(), end=end, hit=hit)
+
+
+_LASER_VERT = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec4 aCol;
+layout(location = 2) in vec2 aUV;
+uniform mat4 uVP;
+out vec4 vCol;
+out vec2 vUV;
+void main() {
+    vCol = aCol;
+    vUV = aUV;
+    gl_Position = uVP * vec4(aPos, 1.0);
+}
+"""
+
+_LASER_FRAG = """
+#version 330 core
+in vec4 vCol;
+in vec2 vUV;
+out vec4 fragColor;
+uniform int uMode;      // 0: beam ribbon, bright along its middle   1: round glow where it lands
+void main() {
+    float a;
+    if (uMode == 0) {
+        float w = 1.0 - abs(vUV.y * 2.0 - 1.0);
+        a = w * w;
+    } else {
+        float r = length(vUV - vec2(0.5)) * 2.0;
+        if (r > 1.0) discard;
+        a = (1.0 - r) * (1.0 - r);
+    }
+    fragColor = vec4(vCol.rgb, vCol.a * a);
+}
+"""
+
+
+class LaserRenderer:
+    """Draws the beam as three additive ribbons (red halo, orange body, white core) and a glow where it lands."""
+    STRIDE = 9 * 4
+
+    def __init__(self):
+        vs = _compile_shader(_LASER_VERT, gl.GL_VERTEX_SHADER)
+        fs = _compile_shader(_LASER_FRAG, gl.GL_FRAGMENT_SHADER)
+        self.program = _link_program(vs, fs)
+        self.u_vp = gl.glGetUniformLocation(self.program, "uVP")
+        self.u_mode = gl.glGetUniformLocation(self.program, "uMode")
+        self.vao = gl.glGenVertexArrays(1)
+        self.vbo = gl.glGenBuffers(1)
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, self.STRIDE, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, self.STRIDE, ctypes.c_void_p(12))
+        gl.glEnableVertexAttribArray(2)
+        gl.glVertexAttribPointer(2, 2, gl.GL_FLOAT, gl.GL_FALSE, self.STRIDE, ctypes.c_void_p(28))
+        gl.glBindVertexArray(0)
+
+    def _draw(self, quads, mode):
+        """quads: list of (4 corners (4,3), rgba (4,)). Each is sent as two triangles."""
+        if not quads:
+            return
+        uv = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
+        rows = []
+        for corners, rgba in quads:
+            for i in (0, 1, 2, 0, 2, 3):
+                rows.append(np.concatenate([corners[i], rgba, uv[i]]))
+        data = np.asarray(rows, np.float32)
+        gl.glUniform1i(self.u_mode, mode)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_STREAM_DRAW)
+        gl.glDrawArrays(gl.GL_TRIANGLES, 0, len(data))
+
+    def render(self, vp, eye, yaw, pitch):
+        now = time.perf_counter()
+        if now - LASER['t'] > 0.12:                    # not fired lately: nothing to draw
+            return
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        fwd = np.array([cp * math.sin(yaw), sp, -cp * math.cos(yaw)])
+        right = np.cross(fwd, np.array([0.0, 1.0, 0.0]))
+        right /= np.linalg.norm(right)
+        up = np.cross(right, fwd)
+        eye = np.asarray(eye, np.float64)
+        start = eye + fwd * 0.6 + right * 0.30 - up * 0.24          # the beam leaves from the lower right of the view
+        end = np.asarray(LASER['end'], np.float64)
+        d = end - start
+        L = float(np.linalg.norm(d))
+        if L < 1e-3:
+            return
+        d /= L
+        flick = 1.0 + 0.12 * math.sin(now * 90.0) + 0.06 * math.sin(now * 37.0)
+        side = np.cross(d, (start + end) * 0.5 - eye)
+        sn = float(np.linalg.norm(side))
+        if sn < 1e-6:
+            return
+        side /= sn
+        ribbons = []
+        for half, rgba in ((0.11, (1.0, 0.12, 0.04, 0.55)), (0.05, (1.0, 0.55, 0.15, 0.85)), (0.018, (1.0, 1.0, 0.9, 1.0))):
+            w = side * half * flick
+            ribbons.append((np.array([start - w, end - w, end + w, start + w]), np.array(rgba, np.float32)))
+        gl.glUseProgram(self.program)
+        gl.glUniformMatrix4fv(self.u_vp, 1, gl.GL_TRUE, vp.astype(np.float32))
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE)                     # additive: the beam glows
+        gl.glDepthMask(gl.GL_FALSE)
+        gl.glBindVertexArray(self.vao)
+        self._draw(ribbons, 0)
+        if LASER['hit']:
+            glow = []
+            for size, rgba in ((0.55, (1.0, 0.25, 0.05, 0.9)), (0.28, (1.0, 0.75, 0.3, 1.0)), (0.1, (1.0, 1.0, 1.0, 1.0))):
+                h = size * flick
+                c = end + (eye - end) * 0.02
+                glow.append((np.array([c - right * h - up * h, c + right * h - up * h,
+                                       c + right * h + up * h, c - right * h + up * h]), np.array(rgba, np.float32)))
+            self._draw(glow, 1)
+        gl.glBindVertexArray(0)
+        gl.glDepthMask(gl.GL_TRUE)
+        gl.glDisable(gl.GL_BLEND)
+
+
+
+class ProjectileRenderer:
+    """Draws projectiles and placed charges as round points."""
+    def __init__(self):
+        vs = _compile_shader(_PROJ_VERT, gl.GL_VERTEX_SHADER)
+        fs = _compile_shader(_PROJ_FRAG, gl.GL_FRAGMENT_SHADER)
+        self.program = _link_program(vs, fs)
+        self.u_vp = gl.glGetUniformLocation(self.program, "uVP")
+        self.vao = gl.glGenVertexArrays(1)
+        self.vbo = gl.glGenBuffers(1)
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glEnableVertexAttribArray(0)
+        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 28, ctypes.c_void_p(0))
+        gl.glEnableVertexAttribArray(1)
+        gl.glVertexAttribPointer(1, 4, gl.GL_FLOAT, gl.GL_FALSE, 28, ctypes.c_void_p(12))
+        gl.glBindVertexArray(0)
+
+    def render(self, vp):
+        if not PROJ.items:
+            return
+        rows = []
+        for p in PROJ.items:
+            if p['kind'] == 'rocket':
+                c = (1.0, 0.55, 0.1, 1.0)
+            elif p['kind'] == 'grenade':
+                c = (0.45, 0.85, 0.3, 1.0)
+            else:
+                c = (1.0, 0.15, 0.1, 1.0) if int(p['age'] * 4) % 2 == 0 else (1.0, 0.9, 0.2, 1.0)
+            rows.append([*p['pos'], *c])
+        data = np.asarray(rows, np.float32)
+        gl.glUseProgram(self.program)
+        gl.glUniformMatrix4fv(self.u_vp, 1, gl.GL_TRUE, vp.astype(np.float32))
+        gl.glEnable(gl.GL_PROGRAM_POINT_SIZE)
+        gl.glBindVertexArray(self.vao)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo)
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, data.nbytes, data, gl.GL_STREAM_DRAW)
+        gl.glDrawArrays(gl.GL_POINTS, 0, len(data))
+        gl.glBindVertexArray(0)
+
+
+class _CachedOverlay(Overlay):
+    """An overlay that redraws its texture only when its state changes."""
+    def draw(self, state):
+        if state != getattr(self, '_state', None):
+            self._state = state
+            self.surf.fill((0, 0, 0, 0))
+            self._render(state)
+            self._data = pygame.image.tostring(self.surf, "RGBA", True)
+        gl.glDisable(gl.GL_DEPTH_TEST)
+        gl.glEnable(gl.GL_BLEND)
+        gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+        gl.glUseProgram(self.program)
+        gl.glActiveTexture(gl.GL_TEXTURE0)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, self.tex)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, self.w, self.h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, self._data)
+        gl.glUniform1i(self.u_tex, 0)
+        gl.glBindVertexArray(self.vao)
+        gl.glDrawArrays(gl.GL_TRIANGLE_FAN, 0, 4)
+        gl.glBindVertexArray(0)
+        gl.glDisable(gl.GL_BLEND)
+        gl.glEnable(gl.GL_DEPTH_TEST)
+
+
+_MAT_NAMES = {b: n for b, n in ((DIRT, 'Dirt'), (STONE, 'Stone'), (BRICK, 'Brick'), (PLANKS, 'Planks'), (STEEL, 'Steel'))}
+
+
+def aimed_cell(player):
+    """The structure cell under the crosshair as a dict of facts, or None."""
+    eye = np.asarray(player.eye, np.float64)
+    fwd = np.asarray(player.forward(), np.float64)
+    so = STRUCTS.raycast_obj(eye, fwd, 40.0)
+    if so is None:
+        return None
+    o = so[2]
+    p = eye + fwd * (so[0] + 0.02)
+    ij = np.floor(((p - o.frame_pos) @ o.R - o.corner) / o.cs).astype(np.int64)
+    if (ij < 0).any() or (ij >= np.array(o.alive.shape)).any() or not o.alive[tuple(ij)]:
+        return None
+    c = tuple(int(v) for v in ij)
+    m = int(o.mat[c])
+    return dict(mat=_MAT_NAMES.get(m, 'Stone'), fixed=isinstance(o, Structure),
+                stress=float(o.stress[c]), cracks=float(o.cdmg[c]), heat=float(o.heat[c]),
+                hard=float(_S_HARD[m]), mass=float(o.cell_mass[c]),
+                grounded=bool(o.anch[c]) if isinstance(o, Structure) else None)
+
+
+def integrity_state(player):
+    """Everything the panel shows as a tuple of strings, so it is redrawn only when something changes."""
+    worst = 0.0
+    for o in STRUCTS.objects():
+        if o.alive.any():
+            worst = max(worst, float(np.where(o.alive, np.maximum(o.stress, o.cdmg / 0.85), 0.0).max()))
+    a = aimed_cell(player)
+    lines = [f"{len(STRUCTS.structs)} fixed   {len(STRUCTS.bodies)} loose   worst cell {min(worst, 1.0) * 100:.0f}%"]
+    if a is None:
+        lines.append("crosshair: no structure")
+    else:
+        lines += [f"crosshair: {a['mat']}, {'fixed' if a['fixed'] else 'loose piece'}",
+                  f"stress {min(a['stress'], 1.5) * 100:.0f}% of limit",
+                  f"cracks {a['cracks'] * 100:.0f}%   heat {a['heat'] * 100:.0f}%",
+                  f"hardness {a['hard']:.1f}   mass {a['mass']:.2f}" + ("" if a['grounded'] is None else f"   grounded {'yes' if a['grounded'] else 'no'}")]
+    return tuple(lines)
+
+
+class IntegrityPanel(_CachedOverlay):
+    """Top left while G is on: colour legend, material strengths, and the cell under the crosshair."""
+    W, H = 440, 392
+
+    def __init__(self):
+        super().__init__(self.W, self.H, 16, 16)
+        self.f_t = _mono(24)
+        self.f_s = _mono(17)
+
+    def _render(self, state):
+        s = self.surf
+        pygame.draw.rect(s, (14, 16, 24, 225), (0, 0, self.W, self.H), border_radius=10)
+        pygame.draw.rect(s, (90, 98, 120, 255), (0, 0, self.W, self.H), 2, border_radius=10)
+        s.blit(self.f_t.render("STRUCTURE INTEGRITY", True, (226, 230, 238)), (14, 10))
+        bx, by, bw, bh = 14, 46, self.W - 28, 16
+        for i in range(bw):
+            x = i / (bw - 1)
+            col = (int(np.interp(x, [0, .5, 1], [.12, .95, .95]) * 255), int(np.interp(x, [0, .5, 1], [.75, .85, .12]) * 255),
+                   int(np.interp(x, [0, .5, 1], [.30, .12, .08]) * 255))
+            pygame.draw.line(s, col, (bx + i, by), (bx + i, by + bh))
+        s.blit(self.f_s.render("safe", True, (180, 188, 204)), (bx, by + 20))
+        end = self.f_s.render("breaks", True, (180, 188, 204))
+        s.blit(end, (bx + bw - end.get_width(), by + 20))
+        s.blit(self.f_s.render("colour = worst of stress, cracks, heat", True, (132, 140, 158)), (14, by + 42))
+        y = by + 72
+        s.blit(self.f_s.render("MATERIAL  compress tension shear hard", True, (70, 190, 230)), (14, y))
+        y += 22
+        for b, name in _MAT_NAMES.items():
+            m = STRUCT_MATERIALS.get(b) if isinstance(STRUCT_MATERIALS, dict) else STRUCT_MATERIALS[b]
+            if m is None:
+                continue
+            vals = m if isinstance(m, dict) else dict(zip(('rho', 'comp', 'tens', 'shear', 'hard'), m))
+            s.blit(self.f_s.render(f"{name:<9} {vals['comp']:8.0f} {vals['tens']:7.0f} {vals['shear']:6.0f} {vals['hard']:5.1f}", True, (226, 230, 238)), (14, y))
+            y += 21
+        y += 12
+        for i, line in enumerate(state):
+            s.blit(self.f_s.render(line, True, (255, 220, 120) if i == 1 else (226, 230, 238)), (14, y))
+            y += 22
+
+
+class Crosshair(_CachedOverlay):
+    SIZE = 44
+    def __init__(self):
+        super().__init__(self.SIZE, self.SIZE, (WIDTH - self.SIZE) // 2, (HEIGHT - self.SIZE) // 2)
+
+    def _render(self, state):
+        c, s = self.SIZE // 2, self.SIZE
+        for col, wd in (((0, 0, 0, 200), 4), ((255, 255, 255, 255), 2)):     # dark outline, then white
+            for a, b in (((c - 14, c), (c - 5, c)), ((c + 5, c), (c + 14, c)),
+                         ((c, c - 14), (c, c - 5)), ((c, c + 5), (c, c + 14))):
+                pygame.draw.line(self.surf, col, a, b, wd)
+        pygame.draw.circle(self.surf, (0, 0, 0, 200), (c, c), 3)
+        pygame.draw.circle(self.surf, (255, 255, 255, 255), (c, c), 1)
+
+
+class WeaponBar(_CachedOverlay):
+    """The six weapons as a row of boxes along the bottom of the screen; the picked one is lit."""
+    BOX_W, BOX_H, GAP = 128, 76, 10
+    SHORT = ['Drill', 'Rifle', 'Grenade', 'Rocket', 'Laser', 'Charge']
+
+    def __init__(self):
+        n = len(WEAPONS)
+        w = n * self.BOX_W + (n - 1) * self.GAP
+        super().__init__(w, self.BOX_H, (WIDTH - w) // 2, HEIGHT - self.BOX_H - 26)
+        self.f_num = pygame.font.SysFont("consolas,dejavusansmono,couriernew,monospace", 24, bold=True)
+        self.f_name = pygame.font.SysFont("consolas,dejavusansmono,couriernew,monospace", 21, bold=True)
+
+    def _render(self, state):
+        weapon, charges = state
+        for i in range(len(WEAPONS)):
+            r = pygame.Rect(i * (self.BOX_W + self.GAP), 0, self.BOX_W, self.BOX_H)
+            on = i == weapon
+            pygame.draw.rect(self.surf, (50, 92, 150, 235) if on else (10, 12, 18, 190), r, border_radius=8)
+            pygame.draw.rect(self.surf, (150, 205, 255, 255) if on else (80, 88, 108, 255), r, 3 if on else 2,
+                             border_radius=8)
+            self.surf.blit(self.f_num.render(str(i + 1), True, (255, 220, 120)), (r.x + 10, r.y + 6))
+            name = self.f_name.render(self.SHORT[i], True, (255, 255, 255) if on else (190, 190, 200))
+            self.surf.blit(name, name.get_rect(center=(r.centerx, r.bottom - 22)))
+            if i == 5 and charges:
+                c = self.f_num.render(str(charges), True, (255, 120, 100))
+                self.surf.blit(c, (r.right - c.get_width() - 10, r.y + 6))
+
+
+class _FpsMeter:
+    """Frames per second, averaged over half a second so the title does not flicker."""
+    def __init__(self):
+        self.t = 0.0
+        self.n = 0
+        self.value = 0.0
+
+    def update(self, dt):
+        self.t += dt
+        self.n += 1
+        if self.t >= 0.5:
+            self.value = self.n / self.t
+            self.t, self.n = 0.0, 0
+        return self.value
+
+
+FPS = _FpsMeter()
 
 
 class ChunkGrid:
@@ -3038,6 +5205,7 @@ def run():
     pygame.mouse.set_visible(False)
     pygame.event.set_grab(True)
 
+    print(_gpu_init())
     settings = default_settings()
     menu = TabMenu(settings)
     settings_panel = SettingsPanel()
@@ -3047,7 +5215,6 @@ def run():
     world = World()
     renderer = Renderer()
     player = PlayerController((0.5, float(terrain_height(0.0, 0.0)) + 2.0, 0.5))
-    world.stamp_block(cube_slot_lo(0), CUBE_SIDE)         # one dirt cube waits in front of the start
     selected = 0
     last_centre = None
     last_caption = None
@@ -3063,6 +5230,16 @@ def run():
     grid = ChunkGrid()
     particles_gl = ParticleRenderer()
     body_gl = DirtBodyRenderer()
+    struct_gl = StructureRenderer()
+    weapon = 0                   # the weapon picked with keys 1-6
+    crosshair = Crosshair()
+    weapon_bar = WeaponBar()
+    proj_gl = ProjectileRenderer()
+    laser_gl = LaserRenderer()
+    integrity_panel = IntegrityPanel()
+    show_integrity = True
+    built_res = settings['struct_res']   # cube detail the layout was last built at
+    pending_layout = True        # the shapes beside the dirt cube are built once the chunks under them are loaded
     menu_frozen = False          # True once the world has been frozen behind the open menu
     clock = pygame.time.Clock()
 
@@ -3127,23 +5304,37 @@ def run():
                     menu.adjust(1)
                 elif e.type == KEYDOWN and e.key in (K_RETURN, K_KP_ENTER):
                     menu.activate()
-            elif e.type == KEYDOWN and e.key == K_t and not bench.active:
-                world.stamp_block(cube_slot_lo(len(world.stamps)), CUBE_SIDE)   # T: another dirt cube
             elif e.type == KEYDOWN and e.key == K_r and not bench.active:
-                world.clear_stamps()                                 # R: remove the dirt cubes (and the damage)
+                pending_reset = True                                 # R: put the whole map back and clear all damage
                 last_centre = None
+            elif e.type == KEYDOWN and K_1 <= e.key <= K_6 and not bench.active:
+                weapon = e.key - K_1                                 # 1-6: pick a weapon
+            elif e.type == MOUSEBUTTONDOWN and e.button == 3 and not menu.open and not bench.active:
+                PROJ.detonate(world, settings)                       # right click: set off the placed charges
             elif e.type == KEYDOWN and e.key == K_f and not bench.active:
                 paused = not paused
             elif e.type == KEYDOWN and e.key == K_v and not bench.active:
-                player.toggle_fly()
-            elif e.type == KEYDOWN and e.key == K_1:
-                bench_toggle = True         # 1 starts a benchmark (autowalk on); 1 again ends it
+                if settings['show_hud']:
+                    show_integrity = not show_integrity      # in G mode V shows/hides the text panels
+                else:
+                    player.toggle_fly()
+            elif e.type == KEYDOWN and e.key == K_F5:
+                bench_toggle = True         # F5 starts a benchmark (autowalk on); F5 again ends it
             elif e.type == MOUSEMOTION and not paused:
                 player.yaw += e.rel[0] * 0.002
                 player.pitch = max(-1.5, min(1.5, player.pitch - e.rel[1] * 0.002))
 
+        if settings['struct_res'] != built_res:                      # cube detail changed: rebuild the cubes at the new detail
+            built_res = settings['struct_res']
+            STRUCTS.clear()
+            BODIES.clear()
+            PROJ.clear()
+            pending_layout = True
         if pending_reset or menu.take_action() == 'reset_damage':
             world.reset_damage()
+            STRUCTS.clear()
+            PROJ.clear()
+            pending_layout = True                                    # the whole map comes back whole
             BODIES.clear()
             world.take_dug_cells()
             PARTS.clear()
@@ -3164,10 +5355,19 @@ def run():
             last_cpu_ms = None
             continue
 
+        GFX['physics_device'] = 'gpu' if (settings['gpu_physics'] and GPU_OK) else 'cpu'
+        CONFIG['debris_on'] = settings['debris_on']
+        CONFIG['debris_amount'] = settings['debris_amount'] / 100.0
+        if not settings['debris_on']:
+            BODIES.clear()
+            PARTS.remove_kind(FX_DUST)
         keys = pygame.key.get_pressed()
         t_load = time.perf_counter()
         if not paused and not modal:
             load_around(world, player.pos[0], player.pos[2], radius=rd)
+            if pending_layout and STRUCTS.layout_ready(world):
+                STRUCTS.build_layout(world, settings['struct_res'])
+                pending_layout = False
         load_ms = (time.perf_counter() - t_load) * 1000.0
 
         if not modal and not paused:
@@ -3188,16 +5388,13 @@ def run():
             if n > 0:
                 wish /= n
             player.update(world, dt, wish, keys[K_SPACE], keys[K_LSHIFT])
-            if pygame.mouse.get_pressed()[0] and not bench.active \
-                    and time.perf_counter() - last_dig >= DIG_INTERVAL:
-                last_dig = time.perf_counter()
-                hit = raycast_terrain(world, player.eye, player.forward(), REACH)
-                if hit is not None:
-                    dug = world.dig(hit, DIG_RADIUS, DIG_STRENGTH)
-                    BODIES.spawn(world, world.take_dug_cells(), int(settings['dirt_cubes']),
-                                 settings['dirt_cube_size'])
+            if pygame.mouse.get_pressed()[0] and not bench.active:
+                fire_weapon(world, player, settings, weapon)         # the picked weapon, at its own rate
+            PROJ.update(world, dt, settings)
             PARTS.update(dt)
             BODIES.update(world, dt, settings['cube_sleep_time'])
+            STRUCTS.update(world, dt)
+            STRUCTS.eject_player(world, player)                      # a falling piece does not trap the player
 
         # Unload distant chunks only when caching is off, and only when the player
         # enters a new chunk, so the check doesn't run every frame.
@@ -3207,10 +5404,8 @@ def run():
         last_centre = centre
 
         # Heading and position go in the window title, since the 3D view has no HUD.
-        name, deg = _heading(player.yaw)
-        state = ("BENCHMARK   " if bench.active else "") + ("PAUSED   " if paused else "") + ("AUTO-WALK   " if auto_walk else "") + f"dust {PARTS.n}   "
-        caption = (f"VoidCraft   {state}facing {name} ({deg:.0f} deg)   "
-                   f"x {player.pos[0]:.1f}  y {player.pos[1]:.1f}  z {player.pos[2]:.1f}")
+        state = ("BENCHMARK   " if bench.active else "") + ("PAUSED   " if paused else "") + ("AUTO-WALK   " if auto_walk else "")
+        caption = f"VoidCraft   {state}{FPS.update(dt):.0f} fps"
         if caption != last_caption:
             pygame.display.set_caption(caption)
             last_caption = caption
@@ -3237,11 +5432,18 @@ def run():
             renderer.draw(world, player.eye, player.yaw, player.pitch,
                           radius=rd - 1, fov=settings['fov'])
             draw_ms = (time.perf_counter() - t_draw) * 1000.0
+            struct_gl.render(renderer.last_vp, 1.0, overlay=settings['show_hud'])
             body_gl.render(renderer.last_vp, 1.0, player.yaw, player.pitch)
+            proj_gl.render(renderer.last_vp)
+            laser_gl.render(renderer.last_vp, player.eye, player.yaw, player.pitch)
             particles_gl.render(player.eye, player.yaw, player.pitch, 1.0, renderer.last_vp)
             if settings['show_hud']:
                 grid.draw(renderer.last_vp, centre[0], centre[1], rd - 1)
-                hud.draw(perf, poller)
+                hud.draw(perf, poller, show_integrity)
+                if show_integrity:
+                    integrity_panel.draw(integrity_state(player))
+            crosshair.draw(0)
+            weapon_bar.draw((weapon, PROJ.n_charges))
         # Measure before the flip, since flip can wait on vsync and that isn't game work.
         last_cpu_ms = (time.perf_counter() - work_start) * 1000.0
         pygame.display.flip()
