@@ -1,0 +1,165 @@
+# Voidcraft code map
+
+Line numbers are for the current uploaded copies of `voidcraft.py` (3,427 lines) and `engineui.py` (10,140 lines), checked on 2026-11-07. They drift as you edit, so each entry also gives a name to search for.
+
+## How the files fit together
+
+- **`voidcraft.py`** is the game: settings menu, HUDs, the three tools, TNT and blast effects, scans, the G monitor, the main loop. It runs inside the engine host and imports the engine with `import voidcraft_engine as _E` (plus a long `from voidcraft_engine import (...)` list, lines 52 to 63, mirrored by the `requires` list in `GAME`, lines 65 to 134).
+- **`engineui.py`** is the host plus the whole engine:
+  - lines 1 to 558 are the launcher window (`gui`) that picks and starts a game;
+  - lines 560 to 10133 are the engine, stored as one raw string `_ENGINE_SRC = r'''...'''` between `# ===== ENGINE BEGIN` (line 559) and `# ===== ENGINE END` (line 10134).
+- **`engineui.py` line = engine line + 559.** Python errors in engine code report the engine's own line numbers, so add 559 to find the spot in `engineui.py`.
+- `py_compile` does not check the engine string. Export it (`python engineui.py --export-engine engine.py`) and compile that instead. The engine must never contain a triple single quote.
+- Do not scroll lines 4124 to 6770 of `engineui.py`: they are the embedded material textures (base64, `_TILE_PNG`).
+- Two more files belong to the scanner and are not part of the game: `scanner_server.py` (Flask server on the laptop, 715 lines) and `scanner.html` (the phone page, 381 lines). The only link to the game is the `.cells` file the server writes and the game reads (see "Scans" below).
+
+---
+
+## voidcraft.py
+
+| Lines | Section | Search for |
+|---|---|---|
+| 1 to 63 | Header, `SPAWN_TREES`/`SPAWN_HUT` switches, loading helpers `_emit`, `_window_ready`, engine imports | `import voidcraft_engine` |
+| 65 to 135 | `GAME` info dict and the exported-names list | `GAME = {` |
+| 136 | `TNT_MAX` (how many charges can be planted) | `TNT_MAX` |
+| 139 to 195 | Settings menu: `SETTINGS_TABS` (DISPLAY, GRAPHICS, SCANS, CONTROLS tabs and key list), `GFX_TAB`, `SCANS_TAB`, scan list layout `SCAN_TOP`/`SCAN_ROW_H`/`SCAN_VIS` | `SETTINGS_TABS` |
+| 204 to 231 | `_NoCache` stand-in, `CACHE`, `CUBE_DETAIL_DEFAULT`, `default_settings()` (also holds the fixed bloom, contrast, sharpness and shake values) | `def default_settings` |
+| 233 to 366 | `TabMenu`: cursor, tabs, folded sections, slider/toggle changes, scan list cursor | `class TabMenu` |
+| 369 to 385 | Panel size and colours (`PANEL_W`, `UI_*`), `_mono` | `PANEL_W` |
+| 387 to 484 | `Overlay` (base), `ResetPanel` (the R menu) | `class Overlay` |
+| 486 to 788 | `SettingsPanel`: draws and clicks the panel, including `_render_scans` | `class SettingsPanel` |
+| 793 to 857 | `_CachedOverlay`, `aimed_cell`, `integrity_state` | `class _CachedOverlay` |
+| 860 to 929 | HUD pieces: `Crosshair`, `TargetLabel`, `InvHud`, `DebrisTint` (G overlay colours for debris) | `class Crosshair` |
+| 938 to 1207 | **G monitor**: `MON_*` constants, `_MON_FRAG` shader, `PerfOverlay` (graphs on the GPU, text four times a second; H switches compact/detailed) | `class PerfOverlay` |
+| 1212 to 1365 | `Survival` and `SurvivalHud` (off by default, `SURVIVAL_ON`), `LoadingScreen`, `_FpsMeter` | `SURVIVAL_ON` |
+| 1374 to 1430 | First-person drawing helpers: `_held_axes`, `_lp`, `_obox`, `_flush`, `tnt_held_prims` | `tnt_held_prims` |
+| 1433 to 1481 | Stone/dirt rules: `STONE_DEPTH`, `BEDROCK_BLOCKS`, `_stone_mask`, `_restore_stone` (only the bottom block is unbreakable) | `_stone_mask` |
+| 1484 to 1579 | TNT charge: `c4_prims`, `c4_aimed`, `C4_*` launch constants (1543 to 1585), `_crumble_dir` | `C4_RADIUS`, `def c4_prims` |
+| 1587 to 1649 | **Blast size**: `BLAST_LEVELS`, `BLAST`, `set_blast_scale` (rescales the blast constants and the engine's awake limits), `_wave_velocity` | `def set_blast_scale` |
+| 1652 to 1706 | `update_debris` (steps the loose cubes each frame), `_surface_normal` | `def update_debris` |
+| 1709 to 1780 | **TNT throw**: `THROW_*`, `throw_velocity`, `throw_path`, `arc_prims`, `flight_pos` | `def throw_path` |
+| 1783 to 2007 | **Tools** (keys 1 to 3): `T_HAMMER/T_CANNON/T_TNT`, `TOOL_*`, `HAMMER_*`, `CANNON_*`, `TS` state, held models (`tool_held_prims`), `tool_ray`, **`tool_crater`**, `ball_prims`, `tool_step` | `def tool_step`, `def tool_crater` |
+| 2010 to 2101 | Falling ground: `SLAB_*` constants (2010), `_drop_groups`, `_drop_cut_ground`, `_schedule_collapse`, `_spawn_ground_debris`, `update_collapse` | `SLAB_SCAN_MARGIN` |
+| 2104 to 2190 | **`c4_explode`**: the blast (crater, scoop rule debris, structures, slabs) | `def c4_explode` |
+| 2196 to 2445 | **`BlastFX`**: fire, smoke, sparks and dust that react to the terrain, plus camera shake | `class BlastFX` |
+| 2448 to 2504 | `ToolBar` (the bottom toolbar) | `class ToolBar` |
+| 2509 to 2602 | Starter hut and bench (off by default): `_hut_design`, `_scaled`, **`_stand_structure`** (puts any material grid on the ground as a Structure), `build_hut` | `build_hut` |
+| 2605 to 2754 | **Scans**: `SCAN_DIRS`, `SCAN_MAT`, `newest_scan`, **`load_scan`**, **`spawn_scan`**, `ScanLibrary`, `_age_text`, `SCAN_LIB` | `def load_scan`, `class ScanLibrary` |
+| 2757 to 2775 | `CUBE_DETAIL_MAX` (50), `apply_launch_args` (`cubedetail-N`) | `apply_launch_args` |
+| 2778 to 3416 | **`run()`**, the game (details below) | `def run` |
+| 3419 to 3420 | `main()` | `def main` |
+
+### Inside `run()` (lines 2778 to 3416)
+
+| Lines | What happens |
+|---|---|
+| 2779 to 2822 | Applies the locked blast size, opens the window, loader, sounds, GPU compute, settings, `TabMenu`, panels. `settings['struct_res']` is set equal to `dirt_cubes` (2799) |
+| 2805 to 2822 | `place_scan(i)`: Tab menu, SCANS tab, stands a scan in front of the player |
+| 2823 to 2877 | Creates everything else: `set_ground_res`, `World`, `Renderer`, player (`SPAWN_POS`), `Arsenal`, `Backdrop`, `SceneTarget`, `PostFX`, `BlastFX`, `StructureRenderer`, `ShadowMap`, HUDs, `PerfOverlay`. Tool state (`tool`, `charging`, `tnt_flights`) lives here |
+| 2879 to 2887 | `mon_counts()` (the numbers shown on the G monitor) |
+| 2888 to 2936 | Pre-loads the map behind the loading screen (terrain 2905 to 2915, meshes 2926 to 2935) |
+| 2942 | Main `while running:` loop starts |
+| 2988 to 3100 | Input events: Esc/quit (2990), R reset menu (2994), Tab menu and SCANS clicks (3015 to 3046), left click (`press_click`, 3048), right click detonate (`det_click`, 3052), keys 1 to 3 pick a tool (3055), X grid (3062), V fly, G monitor (3067), H compact/detail (3070), menu keys (3072 to 3095) |
+| 3100 to 3165 | Rebuild the ground when cube detail changes (`set_ground_res`, 3118), reset (`world.reset_all`, 3128), graphics presets, per-frame settings |
+| 3167 to 3200 | Modal handling: menu or reset panel up, world frozen; live scan list (`SCAN_LIB.poll`, 3184); frozen-frame shortcut |
+| 3200 to 3305 | Gameplay: loads chunks (`load_around`, 3210), trees (3211), movement, `STRUCTS.update` (3242), `update_collapse` (3243), `update_debris` (3245), `tool_step` (3262), TNT throw and plant, **detonation loop** (`c4_explode` 3295 then `blast_fx.spawn` 3298), `blast_fx.update` (3302) |
+| 3306 to 3354 | Chunk unloading (3315), window title (3322), sun shadow map (`shadow.update`, 3329), and the menu-open frame: frozen backdrop, `post.apply` (3344), `settings_panel.draw` (3352) |
+| 3355 to 3410 | Normal frame: `scene.begin` (3357), terrain draw (with shake), structures, debris, blast effects, `post.apply` (3385: bloom, contrast, sharpness), HUD, `perf.draw` (3404) |
+| 3411 to 3416 | Frame timing and `pygame.display.flip` |
+
+---
+
+## engineui.py
+
+### Launcher (lines 1 to 558)
+
+| Lines | Section |
+|---|---|
+| 1 to 31 | Header and notes on the loading protocol |
+| 32 to 147 | `engine_source` (32), `install_engine` (36), `run_game` (55), `launch` (80), `tail_log` (112), `export_engine` (117), `replace_engine` (123) |
+| 148 to 536 | `gui()`, the launcher window |
+| 537 to 559 | `main()` and the engine begin marker (559) |
+
+### Engine (lines 560 to 10133; subtract 559 for engine lines)
+
+| Lines | Section | Key names |
+|---|---|---|
+| 560 to 611 | Imports, optional GPU compute | `_gpu_init` 594 |
+| 612 to 707 | Globals and settings (`TARGET_FPS` 619, `FOV` 625, movement 626 to 628, `CHUNK_SIZE` 670, player size 672), block ids (637), **flat start and terrain limits** (`FLAT_SURFACE_Y` 679, `TERRAIN_GEN_MAX` 688, water and altitude 690 to 692), **ground size** `set_ground_res` (697) | `set_ground_res` |
+| 708 to 790 | Noise, **`terrain_height`** (735), `ChunkData` (757) | `def terrain_height` |
+| 792 to 980 | **Disk cache** (`VOIDCRAFT_CACHE_DIR`, `DiskCache` 809, `DISK_CACHE` 953) and **`generate_chunk`** (968) | `class DiskCache` |
+| 982 to 1510 | `_DirtySet`, `ChunkCache` (992), **`World`** (1026; see methods below), `load_around` (1496) | `class World` |
+| 1520 to 1699 | Chunk mesher: `_padded_occ`, `_greedy_rects`, `_mesh_cubes`, `MeshWorker` | `class MeshWorker` |
+| 1702 to 1757 | Level of detail, graphics quality presets | `quality_snapshot` |
+| 1759 to 2098 | Camera maths, sun shadow matrices, **shaders** (`_VERT_SRC` 1933, `_FRAG_SRC` 1952, `_OVL_VERT` 2034, `_OVL_FRAG` 2045), `_compile_shader` (2055), `_link_program` (2063) | `_compile_shader` |
+| 2099 to 2486 | `Renderer` (draw at 2341), `GpuPoller` (2425), `unload_far_chunks` (2474) | `class Renderer` |
+| 2488 to 2502 | Player collision helpers | `_box_hits_solid` |
+| 2503 to 2955 | Sound: `_Synth` (2578), `SoundFX` (2743), the global `SFX` (2954) | `class SoundFX` |
+| 2957 to 3076 | `_mat_at`, **`PlayerController`** (2970) | `class PlayerController` |
+| 3081 to 3093 | Window fitting (`_fit_window_to_display`). The real main loop is in `voidcraft.py` | |
+| 3138 to 3316 | Cube-ground helpers: `_density_many` 3159, `_cell_contact` 3166, `_density_batch` 3197, `_support` 3240, `_downhill`, `_struct_push`, `_terrain_push` | `def _support` |
+| 3317 to 4030 | **Loose debris cubes**: `DirtCubes` (3317; the global `BODIES` at 3879), `_cube_mesh`, `DirtBodyRenderer` (3973) | `class DirtCubes` |
+| 4044 to 4123 | **Structure physics constants** (`STRUCT_*`, `WOBBLE`, `STRUCT_MATERIALS` 4087, `STRENGTH` 4100, `ARCH_*`), `apply_wobble` (4056) | `STRUCT_GRAVITY` |
+| 4124 to 6770 | Embedded material textures (base64). Do not open | `_TILE_PNG` |
+| 6771 to 6950 | Texture decode, quaternion helpers, cell labelling for connected groups | `_label_cells` |
+| 6951 to 7261 | **`GridObject`**: cell grid, exposed faces, surface points, meshing | `class GridObject` |
+| 7264 to 7756 | **`Structure`**: bonds, support checks, cracking, detaching pieces | `class Structure` |
+| 7759 to 8014 | **`RigidBody`**: mass, inertia, contacts, solver, `step` | `class RigidBody` |
+| 8017 to 8450 | `MAX_LOOSE_BODIES` (8017), axe cutting (`_chop_object` 8020), **`StructureManager`** (8085; the global `STRUCTS` at 8442) | `class StructureManager` |
+| 8447 to 8780 | Garden bed, trees (`tree_spots`, `make_tree`, `build_trees`), `inv_note` (8719), `check_chopped`, planting | `class GardenBed` |
+| 8867 to 8960 | `ShadowMap` | `class ShadowMap` |
+| 8963 to 9020 | G overlay views: `GroundDmgView`, `make_ground_dmg_views` | `make_ground_dmg_views` |
+| 9023 to 9280 | `StructureRenderer`, body/debris helpers (`_split_body`, `_piece_of`) | `class StructureRenderer` |
+| 9283 to 9331 | `ChunkGrid` (chunk outline overlay) | `class ChunkGrid` |
+| 9333 to 9585 | `SceneTarget` (offscreen frame, 9333), `_POST_COMP` shader (9446), **`PostFX`** (9475; `apply` at 9539: bloom, contrast, sharpness) | `class PostFX` |
+| 9588 to 9776 | `FrameTarget`, `_set_vsync`, `Backdrop` | `class Backdrop` |
+| 9779 to 9895 | Frame monitor machinery used by the G panel: `Timed` (9779), `Profiler` (9802), `GpuTimers` (9831), globals `PROF` (9894) and `GT` (9895) | `class Timed` |
+| 9898 to 10133 | Ray and aim helpers (`_first_hit` 9921, `structure_hit_face` 9960, `aim_target` 9977), `WeaponFX` (10025), `Arsenal` (10085) | `class Arsenal` |
+| 10134 | `# ===== ENGINE END =====` | |
+
+### Methods you will touch most
+
+| Class | Where | Methods (line) |
+|---|---|---|
+| `World` (1026) | ground cubes | `dig` 1061, `dig_n` 1110, `_changed_chunks` 1140, `cells_box` 1160, `clear_cells` 1179, `settle` 1203, **`settle_islands` 1234**, `add_damage` 1289, **`weak_islands` 1339**, `reset_damage` 1422, `reset_all` 1439, `take_dug_cells` 1453, `ensure_chunk` 1458 |
+| `DiskCache` (809) | terrain and mesh cache | `load_terrain` 861, `save_terrain` 872, `submit_mesh` 886, `clear` 941 |
+| `DirtCubes` (3317) | loose cubes | `spawn` 3371, `spawn_chunks` 3435, `_separate` 3510, **`update` 3657**, `instances` 3869 |
+| `GridObject` (6951) | any cell grid | `_geometry` 6974, `mesh` 7178, `_mesh_region` 7207, `_integrity_rgb` 7256 |
+| `Structure` (7264) | fixed structures | `refresh_anchors` 7297, `dent` 7385, `blast` 7427, `check_plane` 7538, `update` 7685, `_detach` 7736 |
+| `RigidBody` (7759) | loose solids | `from_cells` 7777, `topple` 7811, `blast` 7822, `_contacts` 7845, `_solve` 7920, `step` 7966 |
+| `StructureManager` (8085) | all of the above | `ground_y` 8098, `add` 8107, `add_ground_body` 8118, `on_terrain_changed` 8181, `blast` 8192, `chop` 8221, `_throw_chunks` 8313, `update` 8358, `raycast` 8425 |
+| `PostFX` (9475) | bloom, contrast, sharpness | `apply` 9539 |
+
+---
+
+## Scans (phone to game)
+
+1. `scanner.html` (phone) talks to `scanner_server.py` (laptop). Routes: `/api/upload`, `/api/demo`, `/api/guided/start`, `/api/job/<id>`, `.../slot/<angle>`, `.../build`, `.../frame/<n>`, `.../model/<v>`, `.../edit`, `.../import`, `/api/jobs`, `/api/about`, `/qr.svg`, `/connect`.
+2. In the server, `shape_from_frames` (line 140, still the placeholder: one frame, inflated) and `build_model` (190) make the cell columns. **Import** (route at 669) writes `<name>_<id>_v<n>.cells` to the export folder (`EXPORT_DIR`, line 43, `--export`).
+3. The `.cells` file is JSON, format `voidcraft.cells.v1`: `cubes_per_block`, `size`, `materials` (wood, dirt, stone, leaf, concrete), `cells` as `[x, y, thickness, material]` columns.
+4. In the game, `ScanLibrary` (voidcraft.py 2675) lists every `.cells` file in `SCAN_DIRS` (2609: game folder, current folder, `scans/`, `~/Downloads/scan_exports`). `load_scan` (2625) turns a file into a material grid at the current cube detail, and `spawn_scan` (2647) stands it 4 blocks ahead via `_stand_structure`. The SCANS tab calls `place_scan` (2805) in `run()`.
+
+---
+
+## Where is... (feature to code)
+
+| Feature | Game | Engine |
+|---|---|---|
+| TNT throw, plant and detonate | `throw_path` 1727, `run` 3262 to 3302, `c4_explode` 2104 | `StructureManager.blast` 8192 |
+| Hammer and cannon | `tool_step` 1941, `tool_crater` 1884 | `World.dig` 1061, `StructureManager.blast` |
+| Crater and loose debris | `c4_explode`, `update_debris` 1652 | `World.dig`, `DirtCubes` 3317 |
+| Blast size (locked 0.75) | `set_blast_scale` 1603, `BLAST_LEVELS` 1591 | none |
+| Cut-off ground falls as a slab | `_drop_cut_ground` 2041, `update_collapse` 2077 | `World.settle_islands` 1234, `World.weak_islands` 1339, `StructureManager.add_ground_body` 8118 |
+| Explosion look (fire, smoke, sparks, shake) | `BlastFX` 2196 | `DirtBodyRenderer.render(bodies=...)` 3998 |
+| Bloom, contrast, sharpness | `run` 3339 to 3385, `default_settings` 226 | `PostFX` 9475, `SceneTarget.begin(force=)` 9367 |
+| G monitor | `PerfOverlay` 990, `mon_counts` 2879, `perf.draw` 3404 | `PROF` 9894, `GT` 9895, `make_ground_dmg_views` 8974 |
+| Scans | `ScanLibrary` 2675, `load_scan` 2625, `spawn_scan` 2647, `place_scan` 2805 | `Structure` 7264 |
+| Disk cache (terrain and meshes) | GRAPHICS tab rows in `SETTINGS_TABS` 161 | `DiskCache` 809, `DISK_CACHE` 953 |
+| Cube detail change (rebuilds the map) | `run` 3118 | `set_ground_res` 697 |
+| Settings menu | `SETTINGS_TABS` 145, `TabMenu` 233, `SettingsPanel` 486 | none |
+| Rigid body physics | none | `RigidBody` 7759 |
+| Structure cracking and collapse | none | `Structure` 7264 |
+| Terrain shape and start area | none | `terrain_height` 735, `generate_chunk` 968 |
+| Sound | none | `SoundFX` 2743 (`SFX` 2954) |
+| Sun shadows | `run` 3329 (`shadow.update`) | `ShadowMap` 8867 |
+| Hut and bench (off) | `build_hut` 2585 | none |

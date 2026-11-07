@@ -1,0 +1,596 @@
+# 1. Executive Summary & Final Academic Mark
+
+**Final Grade: 5.2 / 10.0 — 52 / 100**
+
+This submission contains substantial implementations of voxel editing, meshing, fracture and rigid-body motion, but lacks the correctness guarantees and resource controls expected of a dependable reusable engine. Its primary limitation is synchronous CPU work and large temporary allocations around destruction, compounded by incomplete collision coupling and fragile state invalidation.
+
+Voidcraft_Stage1_Audit.zip[Download Voidcraft_Stage1_Audit.zip](sandbox:/workspace/scratch/2f3a5e680b85/Voidcraft_Stage1_Audit.zip)
+
+The archive contains the full approximately 8,000-word audit, exact corrective patch, defect reproductions, complete reference algorithms and test results. **Your submitted files remain unchanged.**
+
+**Assessment scope:** the actual implementation uses Python, NumPy, Pygame and OpenGL, with optional SciPy/CuPy; the scanner uses Flask/OpenCV. Vulkan, WGPU and Warp are absent. The submission does not establish Python 3.14 compatibility.
+
+**Validation:** all three Python files and the embedded engine compile under Python 3.12.14. I executed controlled headless reproductions and **18 passing remediation tests**. These do not establish Windows compatibility, rendered correctness or 60 FPS on your RTX 5060.
+
+References below use original physical file lines:
+
+- **E:** `engineui.py`
+- **G:** `voidcraft.py`
+- **S:** `scanner_server.py`
+
+# 2. Detailed Rubric Breakdown & Deductions
+
+| Category | Awarded | Available |
+|---|---:|---:|
+| Architecture & Directory Hierarchy | **0.8** | 2.0 |
+| Data Structures & Voxel Efficiency | **1.6** | 2.5 |
+| Physics Simulation & Performance | **1.2** | 2.5 |
+| Code Quality & Maintainability | **0.6** | 1.5 |
+| Extensibility & Gameplay Foundations | **1.0** | 1.5 |
+| **Total** | **5.2** | **10.0** |
+
+## 2.1 Architecture & Directory Hierarchy — 0.8 / 2.0
+
+**Verified strengths**
+
+- Launcher and game run in separate processes.
+- Logical classes distinguish terrain, structures, rigid bodies, debris and renderers.
+- Mesh workers receive snapshots rather than mutable world arrays.
+- Scanner integration uses an interchange file rather than directly depending on rendering.
+
+**Deductions**
+
+- **The engine is an executed raw string:** E560–10133. Ordinary compilation of `engineui.py` does not compile the embedded engine.
+- **Engine/game separation remains incomplete.** Trees, gardening, inventory and other gameplay systems remain inside the engine.
+- **Global mutable dependencies dominate:** `BODIES`, `STRUCTS`, `CONFIG`, `GFX`, caches, dimensions and material-strength controls.
+- Game code imports private engine helpers and directly changes engine constants.
+- `GAME["requires"]` and `engine_min` exist, but `run_game()` does not enforce them.
+- Three `RigidBody` methods are attached through monkey-patching far from the class definition.
+
+The problem is not simply file length. Approximately 2,647 lines are embedded textures. The architectural problem is the number of independent responsibilities sharing one namespace and lifecycle.
+
+## 2.2 Data Structures & Voxel Efficiency — 1.6 / 2.5
+
+**Verified strengths**
+
+- Untouched chunks use compact height arrays.
+- Edited occupancy uses NumPy `int8`, rather than Python objects per voxel.
+- Sphere carving uses vectorized sphere–cell-box intersection.
+- Terrain meshing already removes hidden faces and merges coplanar faces greedily.
+- Chunk revisions and neighbouring-chunk invalidation exist.
+- Structures support regional geometry updates and cached mesh bricks.
+- Connectivity includes both SciPy labeling and bond-graph connected components.
+
+**Deductions**
+
+- A small terrain edit converts an entire chunk into a dense volume.
+- Coarse LOD still starts by constructing fine-resolution occupancy.
+- Local island detection treats components touching the scan boundary as attached; sufficiently large detached pieces can remain suspended.
+- `max_scan` is not a strict cap because the shrinking loop has a radius-dependent minimum.
+- The fallback connectivity algorithm repeatedly traverses the entire grid.
+- Debris sampling, shrinking, rejection and eviction contradict an unconditional “every removed cube becomes one equal-sized cube” rule.
+
+This is the strongest category, but the advertised resolution range exceeds the practical guarantees of the representation.
+
+## 2.3 Physics Simulation & Performance — 1.2 / 2.5
+
+**Verified strengths**
+
+- Rigid bodies have mass, inertia tensors, quaternion orientation and angular velocity.
+- Blast impulses can act off-centre and create rotation.
+- Recentring a body adjusts its origin velocity appropriately.
+- Debris uses arrays and a spatial neighbour index.
+- Debris movement already groups fragments by their individual substep requirements.
+- Normal debris sleep checks require support.
+- CPU profiling and asynchronous GPU timing queries are present.
+
+**Deductions**
+
+- Dynamic rigid-body collisions update only one participant.
+- Sleeping rigid bodies do not receive collision impulses or wake from ordinary contact.
+- Fine cells can be missed by collision and ray sampling.
+- Rigid-body support can remain true after contact disappears.
+- The nominal 80-body limit is bypassed by natural detachment.
+- Round-robin debris movement does not bound the separation workload.
+- Independent timestep clamps discard simulation time.
+- Structure checks, island detection and structure mesh rebuilding can stall the main thread.
+
+I did **not** deduct points for absent rotation, a global-fastest-fragment substep calculation, or a universal mid-air debris sleep bug. Those descriptions would be inaccurate for this submission.
+
+## 2.4 Code Quality & Maintainability — 0.6 / 1.5
+
+**Verified strengths**
+
+- Extensive code maps, tuning notes and design documentation.
+- Cache loading disables pickle.
+- Cache writes use temporary files and replacement.
+- Shader compilation checks and optional GPU startup checks exist.
+- Scanner model-version requests receive basic validation.
+
+**Deductions**
+
+- A reachable settings operation deterministically raises `AttributeError`.
+- No automated test suite, dependency manifest, lockfile or CI configuration is included.
+- AST inspection found no argument/return annotations among **342 engine, 141 game and 45 scanner functions**.
+- Several exception paths silently disable functionality.
+- Mesh-worker exceptions propagate through collection into rendering.
+- Documentation includes stale controls, old build identifiers and incorrect collision descriptions.
+- Texture decoding occurs during engine import, including worker imports.
+
+The documentation earns credit, but it does not compensate for missing executable verification.
+
+## 2.5 Extensibility & Gameplay Foundations — 1.0 / 1.5
+
+**Verified strengths**
+
+- Hammer, cannon and TNT use shared destruction systems.
+- `tool_crater()` consolidates some impact handling.
+- Imported scans become ordinary destructible structures.
+- Settings, progress reporting and scan discovery provide useful development tools.
+
+**Deductions**
+
+- Tools must understand terrain mutation, bedrock restoration, damage, collapse, wake-up and debris bookkeeping.
+- The scanner’s default export directory is absent from the game’s ordinary colocated search paths.
+- Scan import lacks format, index and allocation-budget validation.
+- Scanner reconstruction remains a disclosed single-image extrusion.
+- Terrain and mesh caches are not durable world saves.
+
+# 3. File Structure & Architectural Audit
+
+The submission consists of four implementation files and five documentation files:
+
+```text
+Project-submit-stage1/
+    engineui.py
+    voidcraft.py
+    scanner_server.py
+    scanner.html
+    prefs/
+        codemap - updated.txt
+        design rules - updated.txt
+        playtest checklist.txt
+        prefs - updated.txt
+        README - updated.txt
+```
+
+`engineui.py` combines the launcher, engine, renderers, physics, assets, sound and gameplay utilities. `voidcraft.py` contains a roughly 639-line application loop alongside UI, tools, effects and importing.
+
+A suitable target structure is:
+
+```text
+voidcraft/
+    pyproject.toml
+    README.md
+    src/
+        voxel_engine/
+            api.py
+            config.py
+            materials.py
+            world/
+                chunks.py
+                terrain.py
+                edits.py
+                connectivity.py
+            physics/
+                debris.py
+                rigid.py
+                broadphase.py
+                contacts.py
+                sleep.py
+            rendering/
+                meshing.py
+                jobs.py
+                terrain_gl.py
+                structures_gl.py
+                effects_gl.py
+            io/
+                cache.py
+                cells.py
+            diagnostics/
+                profiling.py
+        voidcraft_game/
+            app.py
+            input.py
+            tools.py
+            effects.py
+            scenes.py
+            ui.py
+        voidcraft_launcher/
+            app.py
+        voidcraft_scanner/
+            server.py
+            reconstruction.py
+            storage.py
+            static/scanner.html
+    assets/textures/
+    tests/
+    benchmarks/
+    docs/
+```
+
+The important boundaries are:
+
+| Boundary | Responsibility |
+|---|---|
+| Input → game | Produce semantic commands: fire, detonate, select tool |
+| Game → world edits | Request mutations through one public interface |
+| World edits → simulation/rendering | Publish actual changed bounds, cells and revisions |
+| Physics → broad phase | Update memberships after motion or shape changes |
+| Meshing workers → renderer | Return immutable CPU meshes with revision identifiers |
+| Renderer → OpenGL | Validate results and perform uploads on the render thread |
+| Scanner → import | Validate interchange data before allocating engine structures |
+
+Moving functions into folders will not establish these boundaries by itself.
+
+### Destruction interdependence
+
+The current cascade is partly implemented:
+
+| Stage | Existing behavior | Gap |
+|---|---|---|
+| Terrain edit | Changes occupancy | Does not intrinsically notify physics |
+| Chunk invalidation | Marks dirty versions and neighbours | Generally sound for local edits |
+| Mesh scheduling | Builds snapshots asynchronously | Repeated edits can leave untracked jobs |
+| Mesh completion | Uploads returned geometry | Revision check occurs after upload |
+| Structure damage | Updates bonds, geometry and mesh revisions | Addition path can retain stale bounds |
+| Support updates | Game calls `on_terrain_changed()` | New callers must remember this |
+| Sleeping objects | Regional wake-up exists | No general propagation through support dependencies |
+| Delayed collapse | Rechecks weakened terrain | Synchronous and spatially limited |
+
+A destruction transaction needs to notify **every consumer of the changed geometry**. A dirty rendering flag is not a physics notification.
+
+# 4. Critical Technical Red Flags & Deep-Dive Issues
+
+The archive contains the complete focused patch and fully implemented algorithms. The following are the principal findings.
+
+## 4.1 Changing cube detail crashes
+
+**Location:** G52–63, G219, G3125–3127.
+
+The game imports the engine mesh cache as `CACHE`, then replaces that name with the disk-cache object:
+
+```python
+CACHE = getattr(_E, 'DISK_CACHE', None) or _NoCache()
+```
+
+Later, changing cube detail executes:
+
+```python
+with CACHE.lock:
+```
+
+`DiskCache` has no `lock`, `mesh` or `mesh_bytes`.
+
+**Reproduced exception:**
+
+```text
+AttributeError: 'DiskCache' object has no attribute 'lock'
+```
+
+The exact correction is to preserve distinct references:
+
+```diff
+-    apply_wobble, Arsenal, Backdrop, BODIES, BODY_MAX, build_trees, CACHE, check_chopped, CHUNK_SIZE,
++    apply_wobble, Arsenal, Backdrop, BODIES, BODY_MAX, build_trees, CACHE as MESH_CACHE, check_chopped, CHUNK_SIZE,
+@@
+-            with CACHE.lock:
+-                CACHE.mesh.clear()
+-                CACHE.mesh_bytes = 0
++            with MESH_CACHE.lock:
++                MESH_CACHE.mesh.clear()
++                MESH_CACHE.mesh_bytes = 0
+```
+
+The patch also clears `renderer._waiting_set` when clearing its queue.
+
+## 4.2 High detail causes cubic memory growth
+
+**Location:** E697–703, E766–769, E1520–1541.
+
+For resolution \(r\):
+
+\[
+N_C=15r,\qquad
+N_H=15\left\lceil\frac{48r+2}{15}\right\rceil
+\]
+
+A dense terrain chunk needs:
+
+\[
+N_C^2N_H\ \text{bytes}
+\]
+
+for its `int8` occupancy alone.
+
+| Detail | One dense edited chunk | Height arrays for the 961-chunk map |
+|---:|---:|---:|
+| 5 | 1.37 MiB | 20.6 MiB |
+| 10 | 10.62 MiB | 82.5 MiB |
+| 25 | 162.94 MiB | 515.5 MiB |
+| 50 | **1,295.51 MiB** | **2,062.1 MiB** |
+
+At detail 50, a small dig can therefore allocate approximately **1.27 GiB** before mesh snapshots, labels, temporary masks or physics data.
+
+These are calculated array sizes, not measured peak process memory.
+
+**Hardware interpretation:** this initially consumes system RAM. It is not primarily an RTX 5060 VRAM problem.
+
+**Concrete replacement supplied:** `SparseColumns` implements immutable column heights plus edited 16³ bricks, including sampling, bounded reads and mutation. A tested single edit at detail 50 allocates a **4,096-byte occupancy brick**.
+
+It is explicitly not a drop-in `.arr` replacement. Direct density mutation must move to its API, and full-chunk mesh snapshots still require separate restructuring.
+
+## 4.3 Mesh work escapes its cap, and stale geometry uploads
+
+**Location:** E1683–1699, E2289–2308, E2383–2395.
+
+`pending` contains one entry per chunk. When that chunk changes again, a new future can overwrite the entry while the old job continues.
+
+**Reproduction:** twenty submissions produced:
+
+```text
+Tracked pending entries:       1
+Submitted unfinished futures: 20
+```
+
+The nominal six-entry cap therefore does not measure all submitted work.
+
+Separately, `_upload()` runs before the returned revision is checked. Old geometry can be displayed even though it is rejected from the cache.
+
+**The supplied patch:**
+
+- Allows one tracked job per chunk.
+- Coalesces subsequent edits until that job finishes.
+- Discards stale results before upload.
+- Rejects obsolete requested LOD results.
+- Promotes waiting jobs after discarded completions.
+
+**Remaining limitation:** detail resets can clear tracked futures while process jobs are still running. A full lifecycle fix must retain retired-generation accounting and use world-generation tokens. The focused patch does not claim to complete that work.
+
+## 4.4 Rigid-body collisions lose momentum
+
+**Location:** E7845–7892, E7920–7964, E8358–8381.
+
+The contact solver receives the obstacle’s velocity but not its dynamic response. Effective mass uses only the current body’s inverse mass and inertia, and only that body receives an impulse.
+
+**Controlled reproduction:**
+
+| Quantity | Before | After |
+|---|---:|---:|
+| Combined x momentum | 0.1536 | **0** |
+| Sleeping target velocity | 0 | **0** |
+| Target asleep | Yes | **Yes** |
+
+For a normal \(n\), effective inverse mass must include both bodies:
+
+\[
+k=m_A^{-1}+m_B^{-1}
++(r_A\times n)^TI_A^{-1}(r_A\times n)
++(r_B\times n)^TI_B^{-1}(r_B\times n)
+\]
+
+Apply equal-and-opposite impulses and their angular contributions.
+
+**Complete implementation supplied:** `PairContact` implements accumulated normal impulses, restitution, two-tangent friction and reciprocal linear/angular impulses. It also wakes a sleeping impact target.
+
+Its equal-mass inelastic test changes velocities from \(1,0\) to \(0.5,0.5\).
+
+Integration requires retaining collision-partner identity and solving each shared pair once. Inserting it independently into both existing body passes would be incorrect.
+
+## 4.5 Rigid bodies can sleep using stale support
+
+**Location:** E7966–8014.
+
+`support` is initialized before the substep loop. A contact in the first substep can set it true; later contact-free substeps leave it true.
+
+**Reproduction:** one supported substep followed by two contact-free substeps still produced:
+
+```text
+supported = True
+asleep = True
+```
+
+The SVD test also checks spatial spread rather than actual support. Spread-out wall contacts can satisfy it.
+
+**Complete implementations supplied:**
+
+- `stable_support`: selects upward, nearby, quiet contacts; constructs their projected convex hull; tests whether the COM projection lies inside it.
+- `update_sleep`: applies explicit linear/angular speed thresholds and a dwell timer, resetting immediately when support disappears.
+
+These must use fresh contacts after final integration. They do not replace support-change wake propagation.
+
+## 4.6 Fine voxels are missed by collision and ray sampling
+
+**Location:** E3711 onward, E8425–8440, E9907–9918.
+
+Debris substeps use:
+
+```python
+ceil(max_abs_velocity * dt * 16)
+```
+
+capped at six, without scaling to cell size.
+
+**Reproduction at detail 50:**
+
+- Fragment width: 0.02 blocks.
+- Wall: x = 0.12–0.14.
+- Fragment starts at x = 0.10.
+- Initial horizontal speed: 30 blocks/s.
+- After one update: **x ≈ 0.5524**, beyond the wall.
+
+A structure covering x = 0.01–0.03 was also missed by the fixed 0.05-step structure raycast. Terrain rays step by 0.1.
+
+**Complete implementations supplied:**
+
+- `voxel_ray`: exact grid DDA traversal, including negative directions, boundary starts and tied-axis crossings.
+- `swept_terrain_box`: translating AABB collision against voxel boxes using Minkowski expansion and slab intersection.
+
+The swept-box implementation is a correctness baseline, not a rotating-body CCD solver. Replacing raycasts alone does not fix debris tunnelling.
+
+## 4.7 Connectivity and stress workloads are not bounded reliably
+
+**Location:** E1234–1272, E1339–1420, E6838–6933, E7685–7756, E9247–9271.
+
+Let \(V\) be grid cells, \(D\) graph diameter, \(K\) components and \(P\) tested planes.
+
+| Operation | Relevant cost |
+|---|---|
+| Ordinary compiled labeling | \(O(V)\) |
+| Bond graph construction/components | \(O(V+E)\) |
+| Current repeated label propagation | \(O(VD)\), potentially \(O(V^2)\) |
+| Per-component whole-grid masks | \(O(KV)\) |
+| Repeated plane checks | Repeated labeling across \(P\) planes |
+
+A normal flood fill is not intrinsically “cubic” in the number of cells. Cubic cost in a grid’s **side length** can simply mean visiting every cell once.
+
+Additional problems:
+
+- SciPy is attempted before CuPy. When SciPy succeeds, the GPU toggle does not move that operation to the GPU.
+- CuPy fallback repeatedly synchronizes to test convergence.
+- Debris movement and rigid impulses remain CPU operations.
+- The stress time-debt mechanism limits average work, not an individual frame’s stall.
+- Ground slabs silently stop forming without SciPy.
+- Structures above 40,000 occupied cells skip stress checking. Increasing resolution therefore changes physical behavior dramatically.
+
+**Complete replacement fallback supplied:** `label_bonded`, using path compression and union by size, with broken-bond and cut-plane support. Its connectivity matches the existing SciPy implementation across 120 randomized cases.
+
+It remains a Python implementation; no claim is made that it outperforms compiled SciPy.
+
+## 4.8 Particle and rigid-body caps do not guarantee bounded cost
+
+**Location:** E3494–3867, E8304–8381; G1652–1687.
+
+- Round-robin movement selects a subset, but `_separate()` processes **all awake debris**.
+- Separation retains full-population allocations and scans.
+- Sleeper-cache validation compares arrays rather than using a mutation revision.
+- Dense buckets can still generate quadratic candidate counts.
+- One large fragment increases the bucket size for every small fragment.
+- The game’s damping reversal uses a different timestep from enlarged subset stepping.
+- Emergency sleep has no absolute low-speed condition.
+- Natural structure detachment bypasses the body cap.
+
+**Reproduction:** natural detachment produced 81 bodies despite `MAX_LOOSE_BODIES = 80`.
+
+Exact corrective insertion:
+
+```python
+self._cap_bodies(world)
+awake = [b for b in self.bodies if not b.asleep]
+```
+
+The archive also includes a complete `AABBHash` implementation with update, removal, queries and pair enumeration, tested against brute force.
+
+**Allocation interpretation:** the source supports concern about allocation/copy bandwidth. It does not establish cyclic Python garbage collection as the measured bottleneck. Disabling GC would be an unjustified first response.
+
+## 4.9 Steel deformation can leave incorrect bounds
+
+**Location:** E7017–7034, E7334–7382.
+
+Incremental geometry assumes removal-only edits and shrinks existing bounds. The dent operation can add rim cells outside those bounds.
+
+**Reproduction:** a live cell was added at x index 4, but the exclusive upper bound remained 3.
+
+Exact conservative correction:
+
+```diff
+-        self._geometry((lo, hi))
++        self._geometry(None if add is not None else (lo, hi))
+```
+
+This rebuilds complete geometry when adding cells. The supplied regression verifies the expanded bounds.
+
+## 4.10 Additional verified limitations
+
+**Rendering**
+
+- Terrain multi-draw batching is implemented.
+- Terrain membership uses a square chunk ring without camera-frustum filtering.
+- GPU arena growth reallocates and copies the entire previous buffer.
+- Structure mesh bricks are concatenated and the complete mesh reuploaded after changes.
+- Cache hits still load arrays on the calling thread.
+- Cache signatures omit some helper/constants dependencies.
+- GPU totals combine latest measurements that may originate from different frames.
+
+**Scanner and importing**
+
+- `_CUT_CACHE` uses `id(frame)` without retaining the frame; ID reuse can return an unrelated stale mask.
+- Job threads and resident history are not globally bounded.
+- JSON history writes are non-atomic.
+- Deleting a running job does not cancel its worker.
+- LAN mutation routes lack pairing authorization.
+- The default `scan_exports` folder is absent from ordinary colocated discovery.
+- `.cells` loading accepts unbounded extents and unchecked material indices before allocation.
+- Reconstruction selects one image and inflates its silhouette. Multi-view reconstruction is not implemented.
+
+# 5. Targeted Recommendations & Roadmap
+
+## Priority 1 — Before adding features
+
+### 1. Repair correctness and establish one edit boundary
+
+Apply the focused patch, then consolidate mutation notifications.
+
+Every edit must consistently update:
+
+1. Canonical occupancy/materials.
+2. Changed bounds and revision identifiers.
+3. Mesh invalidation.
+4. Structure geometry and spatial memberships.
+5. Support state and sleeping-body wake-up.
+6. Removed-cell/debris accounting.
+
+**Acceptance:** detail changes do not crash; obsolete geometry is rejected; support removal wakes affected objects; pending and retired work remain accounted for.
+
+### 2. Make the engine a normal importable package
+
+Export the embedded engine into a real module first. Move assets and game-specific systems out, then introduce the boundaries in section 3.
+
+Headless numerical tests should not require graphics stubs or texture decoding.
+
+**Acceptance:** a reproducible dependency installation, ordinary imports, public interfaces and explicit application cleanup.
+
+### 3. Restore physics invariants
+
+Integrate the supplied contact, support, sleep and query kernels through shared contact records.
+
+**Acceptance:**
+
+- Dynamic contacts conserve momentum absent external forces.
+- Sleeping targets respond to impact.
+- Airborne bodies cannot sleep.
+- Fine-cell rays hit reliably.
+- Translating fragments do not cross thin voxel walls undetected.
+
+The reference algorithms are complete; their integration into the live engine remains necessary.
+
+## Priority 2 — Performance work
+
+| Work | Concrete starting point | Measure |
+|---|---|---|
+| Avoid dense promotion | Supplied `SparseColumns` | Edited storage and peak RSS |
+| Reduce rigid candidate scans | Supplied `AABBHash` | Candidate pairs and contact time |
+| Correct fallback connectivity | Supplied `label_bonded` | Labeling latency and temporary memory |
+| Bound meshing | Focused job patch, then generation/byte accounting | Actual outstanding jobs and snapshot bytes |
+| Separate distant scenery | Direct heightfield meshing outside editable region | Loading time and fine-volume allocation |
+
+**Keep the existing greedy mesher.** It already exists and should not be presented as missing work.
+
+Benchmark fixed-seed scenarios at detail 5 and 10 first:
+
+- Idle scene.
+- Single and simultaneous blasts.
+- Ten repeated blasts.
+- Eighty interacting rigid bodies.
+- Support removal under sleeping objects.
+- Detail reset while jobs are pending.
+
+Record frame p50/p95/p99 and maximum, edit-to-collision latency, edit-to-visible-mesh latency, CPU/worker memory and GPU memory. A 60 Hz frame allows **16.67 ms**; no target-laptop pass has been demonstrated by this review.
+
+## Priority 3 — Gameplay milestones
+
+1. **Deterministic destruction test scene:** pillar, cantilever, thin wall, stacked bodies and detached island, with recorded seeds and commands.
+2. **Reliable scanner interchange:** consistent paths, validated format/material indices and a maximum post-resampling allocation.
+3. **Versioned sandbox saves:** persist edited terrain and object state, rather than treating rendering caches as saves.
+
+**The next milestone should be dependable destruction under a defined workload.** Additional effects, rendering backends or AI integration should follow the crash, collision, support and memory corrections.

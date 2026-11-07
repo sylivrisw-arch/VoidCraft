@@ -1,0 +1,28 @@
+# Voidcraft design rules (stated by Will)
+
+1. Everything in the world is built from the same small cubes as the terrain (one cell = 1/cube-detail block, 0.2 block at the default 5). Structures use the engine's own cell grid at struct_res, which follows cube detail, and their cell edges line up with the ground cubes' edges. No separate coarser cell size for test shapes or new objects.
+2. Scoop rule: what a blast removes is what comes out as debris. A destroyed structure cell becomes exactly one cube of its own size; a ground cube dug out becomes one debris cube. No splitting a cell into several, no inventing extra pieces. The detonation message shows "removed X structure + Y ground cubes, threw Z debris cubes" so it can be checked.
+3. New things are made the same way from here on: terrain cubes and structure cubes, differing only in material.
+
+## Things that follow the rules (as of 2026-11-07)
+- Scanned objects (.cells files from the phone scanner) are placed as ordinary fixed Structures. The file's cells are resampled to the current cube detail, so they use the same cell size as everything else and can be cut, cracked and blasted.
+- The game sets struct_res equal to the cube detail at start, so structures, trees, scans and debris all share the ground's cube size (the engine's own default of 2 is only used if the game does not override it).
+- Blast debris cubes and blast effect cubes (fire, smoke, dust, sparks) are sized in ground cubes, so they follow the cube detail.
+- STRUCT_DEBRIS_SPLIT = 1 in the engine: a destroyed structure cell is thrown as exactly one cube of its own size (2 restores the old eight-half-size-cubes-per-cell throw).
+
+## Where the game still departs from the rules
+Rule 1 (lattice cubes):
+- Blast effect cubes are free-floating visual cubes of varying size, not placed on the lattice.
+- Ground slabs that fall as one rigid body use coarser cells (2x2x2, 3x3x3...) when they hold more than 5000 cells (`max_cells` in `add_ground_body`).
+- The held tools (hammer, cannon, TNT), the planted TNT box (0.42 block) and the cannonball (1.5 ground cubes across, so not a whole number of cells) are not on the lattice. They are drawn from boxes.
+
+Rule 2 (scoop rule):
+- TNT debris from the ground is smaller than the cube it came from. Each thrown cube is drawn at `C4_DEBRIS_SIZE` (0.5) of a ground cube, and a further 0.82 on flat ground (`C4_DEBRIS_SCALE`), so about 0.41. The count matches, the size does not.
+- A TNT blast that digs more than `C4_EXACT_MAX` (2600) ground cubes throws only a sample of them, at most `C4_MAX_CUBES` (487 at the locked 0.75 blast size). At the default cube detail of 5 the crater holds roughly 1,500 cubes (estimate), so every cube is thrown. The crater grows with the cube of the cube detail, so from about detail 6 upward (estimate) the sampling starts.
+- The hammer and cannon (`tool_crater`) throw at most 500 of the cubes they dig. The hammer's crater is small enough to be under that at detail 5; the cannon's is roughly 700 cubes (estimate), so it throws a sample.
+- Cut-off ground that is too small to become a slab (under `SLAB_MIN_CELLS`, 1500) crumbles to cubes, capped at `SLAB_DEBRIS_MAX` (3000) per blast.
+
+## Related engine facts
+- STRUCT_UNBREAKABLE_CELLS was 2000 (structures above it never fail under load); it is now 40000 so shapes at full cube detail can still collapse.
+- Blast size is locked at 0.75, so the crater radius in play is 1.425 blocks, not the base 1.9. `set_blast_scale` also raises the engine's `HARD_AWAKE_CUBES` to 2600.
+- The test cube (BENCH_* and the Q key) has been removed from the engine and the game.
